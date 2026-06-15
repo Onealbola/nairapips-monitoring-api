@@ -1,3 +1,5 @@
-MetaTrader5
 Flask
 flask-cors
+requests
+supabase
+gunicorn
