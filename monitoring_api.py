@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
 from datetime import datetime, timezone
-import os, re
+import os
 
 app = Flask(__name__)
 CORS(app)
@@ -17,6 +17,15 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+ACTIVE_ACCOUNT_STATUSES = {
+    "assigned_active", "active", "current_active",
+    "phase1_active", "phase2_active", "funded_active", "live", "funded"
+}
+TERMINAL_ACCOUNT_STATUSES = {
+    "breached", "breached_archived", "archived_phase1", "archived_phase2",
+    "passed", "disabled", "locked", "profit_protected"
+}
 
 
 def now_iso():
@@ -50,20 +59,17 @@ def clean_login(v):
 
 def valid_login(v):
     v = clean_login(v)
-    return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL"]))
+    return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL", "TEST_LOGIN"]))
 
 
 def target_for_stage(stage):
-    stage = str(stage or "").strip().lower()
-    if stage == "phase1":
+    stage = str(stage or "").strip().lower().replace(" ", "")
+    if stage in {"phase1", "phase_1"}:
         return 10.0
-    if stage == "phase2":
+    if stage in {"phase2", "phase_2"}:
         return 8.0
+    # Funded/live accounts do NOT have phase pass target.
     return 0.0
-
-
-def active_state(stage):
-    return "funded_active" if str(stage).lower() == "funded" else f"{stage}_active"
 
 
 def waiting_after_pass(stage):
@@ -77,7 +83,7 @@ def waiting_after_pass(stage):
 
 def risk_zone(current_dd_percent):
     d = num(current_dd_percent)
-    if d >= 20:
+    if d >= MAX_DD_PERCENT:
         return "breached"
     if d >= 18:
         return "critical"
@@ -88,12 +94,12 @@ def risk_zone(current_dd_percent):
     return "safe"
 
 
-def static_dd(start_balance, equity):
+def static_dd(start_balance, live_value):
     start = num(start_balance)
-    eq = num(equity)
+    v = num(live_value)
     if start <= 0:
         return 0.0
-    return round(max(((start - eq) / start) * 100, 0.0), 2)
+    return round(max(((start - v) / start) * 100, 0.0), 2)
 
 
 def dd_used_from_static(dd_percent):
@@ -102,13 +108,26 @@ def dd_used_from_static(dd_percent):
     return round(max((num(dd_percent) / MAX_DD_PERCENT) * 100, 0.0), 2)
 
 
+def account_is_monitorable(row):
+    if not row:
+        return False
+    status = str(row.get("account_status") or row.get("status") or "").lower().strip()
+    if status in TERMINAL_ACCOUNT_STATUSES:
+        return False
+    if status and status not in ACTIVE_ACCOUNT_STATUSES:
+        # Keep this strict enough to avoid archived/old accounts, but tolerant for missing statuses.
+        if "active" not in status and "assigned" not in status and status not in {"funded", "live"}:
+            return False
+    return valid_login(row.get("mt5_login")) and bool(str(row.get("mt5_server") or "").strip())
+
+
 def fetch_traders_by_ids(ids):
     ids = [str(x) for x in ids if x]
     if not ids:
         return {}
     out = {}
     for i in range(0, len(ids), 100):
-        chunk = ids[i:i+100]
+        chunk = ids[i:i + 100]
         try:
             rows = supabase.table("traders").select("*").in_("id", chunk).execute().data or []
             for r in rows:
@@ -128,7 +147,7 @@ def get_account_by_id_or_login(account_id=None, mt5_login=None):
         if login:
             rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(10).execute().data or []
             for r in rows:
-                if str(r.get("account_status") or "").lower() in {"assigned_active", "active", "current_active"}:
+                if account_is_monitorable(r):
                     return r
             return rows[0] if rows else None
     except Exception as e:
@@ -153,7 +172,6 @@ def safe_update(table, payload, col, val):
 
 
 def alert_once(account, event_type, title, message, severity="info", snapshot=None):
-    """Create admin action evidence without depending on the main API."""
     account_id = account.get("id") if account else None
     trader_id = account.get("trader_id") if account else None
     key = f"{event_type}:{account_id or ''}:{clean_login((account or {}).get('mt5_login'))}"
@@ -172,10 +190,8 @@ def alert_once(account, event_type, title, message, severity="info", snapshot=No
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
-    # Try common alert/event tables. Fail-safe: monitoring_events always records evidence.
     for table in ["monitoring_alerts", "account_alerts", "admin_alerts"]:
         try:
-            # If a unique dedupe_key exists, upsert prevents alert spam. If not, insert may still work.
             supabase.table(table).upsert(payload, on_conflict="dedupe_key").execute()
             return True
         except Exception:
@@ -191,24 +207,41 @@ def apply_intelligence(account, snapshot):
     if not account:
         return None
 
-    start = num(account.get("start_balance") or account.get("account_size") or snapshot.get("balance") or 0)
-    equity = num(snapshot.get("equity") or snapshot.get("current_equity") or account.get("current_equity") or start)
+    start = num(account.get("start_balance") or account.get("account_size") or snapshot.get("account_size") or snapshot.get("balance") or 0)
+    # MT5 engine may send balance as account size/reference in old versions, so prefer explicit live balance keys first.
+    live_balance = num(
+        snapshot.get("mt5_balance")
+        or snapshot.get("live_balance")
+        or snapshot.get("account_balance")
+        or snapshot.get("current_balance")
+        or account.get("current_balance")
+        or start
+    )
+    equity = num(snapshot.get("equity") or snapshot.get("current_equity") or account.get("current_equity") or live_balance or start)
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
     target = target_for_stage(stage)
     breach_level = round(start * (1 - MAX_DD_PERCENT / 100), 2) if start else 0.0
 
     old_high = num(account.get("highest_equity") or start)
-    old_low = num(account.get("lowest_equity") or start)
+    old_low_equity = num(account.get("lowest_equity") or start)
+    old_low_balance = num(account.get("lowest_balance") or old_low_equity or start)
     snap_high = num(snapshot.get("highest_equity") or 0)
-    snap_low = num(snapshot.get("lowest_equity") or snapshot.get("recorded_lowest_equity") or 0)
+    snap_low_equity = num(snapshot.get("lowest_equity") or snapshot.get("recorded_lowest_equity") or 0)
+    snap_low_balance = num(snapshot.get("lowest_balance") or snapshot.get("recorded_lowest_balance") or 0)
 
     highest = round(max(start, equity, old_high, snap_high), 2)
-    low_candidates = [x for x in [start, equity, old_low, snap_low] if x and x > 0]
-    lowest = round(min(low_candidates), 2) if low_candidates else equity
+    low_equity_candidates = [x for x in [start, equity, old_low_equity, snap_low_equity] if x and x > 0]
+    lowest_equity = round(min(low_equity_candidates), 2) if low_equity_candidates else equity
+    low_balance_candidates = [x for x in [start, live_balance, old_low_balance, snap_low_balance] if x and x > 0]
+    lowest_balance = round(min(low_balance_candidates), 2) if low_balance_candidates else live_balance
 
-    current_dd = static_dd(start, equity)
+    # NairaPips rule: static DD breach is based on the lower of live balance/equity, and history is permanent.
+    live_risk_value = min([x for x in [live_balance, equity] if x and x > 0] or [equity or live_balance or start])
+    worst_risk_value = min([x for x in [lowest_balance, lowest_equity] if x and x > 0] or [live_risk_value])
+
+    current_dd = static_dd(start, live_risk_value)
     current_dd_used = dd_used_from_static(current_dd)
-    worst_dd = static_dd(start, lowest)
+    worst_dd = static_dd(start, worst_risk_value)
     worst_dd_used = dd_used_from_static(worst_dd)
     dd_remaining = round(max(MAX_DD_PERCENT - current_dd, 0), 2)
     zone = risk_zone(current_dd)
@@ -220,34 +253,36 @@ def apply_intelligence(account, snapshot):
     target_equity = round(start * (1 + target / 100), 2) if target else 0.0
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
+    # Funded/live has target=0, so it cannot phase-pass by profit target.
     target_hit = bool(target and highest >= target_equity and profit_percent >= target)
-    breached = bool((not target_hit) and start and equity <= breach_level)
+    breached = bool(start and worst_risk_value <= breach_level)
 
     status = str(account.get("account_status") or "assigned_active").lower()
     phase_pass_status = ""
     lifecycle_state = None
     next_phase = stage
 
-    if target_hit:
-        zone = "passed"
-        phase_pass_status = f"{stage}_passed"
-        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
-        lifecycle_state, next_phase = waiting_after_pass(stage)
-    elif breached:
+    if breached:
         zone = "breached"
         status = "breached_archived"
         lifecycle_state = "breached"
         next_phase = stage
+    elif target_hit:
+        zone = "passed"
+        phase_pass_status = f"{stage}_passed"
+        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
+        lifecycle_state, next_phase = waiting_after_pass(stage)
 
     update = {
-        "current_balance": num(snapshot.get("balance") or account.get("current_balance") or start),
+        "current_balance": live_balance,
         "current_equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
         "current_profit": current_profit,
         "current_profit_percent": current_profit_percent,
         "highest_equity": highest,
-        "lowest_equity": lowest,
+        "lowest_equity": lowest_equity,
+        "lowest_balance": lowest_balance,
         "absolute_drawdown_percent": current_dd,
         "drawdown_percent": current_dd,
         "dd_used_percent": current_dd_used,
@@ -256,6 +291,7 @@ def apply_intelligence(account, snapshot):
         "worst_dd_used_percent": worst_dd_used,
         "dd_remaining_percent": dd_remaining,
         "breach_equity_level": breach_level,
+        "breach_balance_level": breach_level,
         "target_percent": target,
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
@@ -271,6 +307,9 @@ def apply_intelligence(account, snapshot):
         update["archive_reason"] = snapshot.get("reason") or ("Target reached" if target_hit else "Static drawdown breached")
         if target_hit:
             update["passed_at"] = now_iso()
+        if breached:
+            update["breach_detected_at"] = now_iso()
+            update["breach_reason"] = update["archive_reason"]
 
     safe_update("trader_accounts", update, "id", account.get("id"))
 
@@ -299,11 +338,12 @@ def apply_intelligence(account, snapshot):
         "trader_id": account.get("trader_id"),
         "trader_account_id": account.get("id"),
         "mt5_login": clean_login(account.get("mt5_login") or snapshot.get("mt5_login")),
-        "event_type": "phase_passed" if target_hit else ("breached" if breached else "snapshot"),
+        "event_type": "breached" if breached else ("phase_passed" if target_hit else "snapshot"),
         "risk_zone": zone,
         "phase_label": stage,
         "phase_pass_status": phase_pass_status,
-        "balance": start,
+        "balance": live_balance,
+        "account_size": start,
         "equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
@@ -315,8 +355,10 @@ def apply_intelligence(account, snapshot):
         "worst_static_drawdown_percent": worst_dd,
         "worst_dd_used_percent": worst_dd_used,
         "highest_equity": highest,
-        "lowest_equity": lowest,
+        "lowest_equity": lowest_equity,
+        "lowest_balance": lowest_balance,
         "breach_equity_level": breach_level,
+        "breach_balance_level": breach_level,
         "target_percent": target,
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
@@ -332,14 +374,50 @@ def apply_intelligence(account, snapshot):
     except Exception:
         pass
 
-    if target_hit:
+    if breached:
+        alert_once(account, "breached", "ACCOUNT BREACHED", f"MT5 {account.get('mt5_login')} crossed static DD limit. Worst value {worst_risk_value} <= breach level {breach_level}.", "critical", event)
+    elif target_hit:
         alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting next-stage MT5 assignment.", "success", event)
-    elif breached:
-        alert_once(account, "breached", "ACCOUNT BREACHED", f"MT5 {account.get('mt5_login')} equity {equity} hit/below breach level {breach_level}.", "critical", event)
     elif current_dd >= 10:
-        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}%.", "warning", event)
+        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}%. DD limit used {current_dd_used}%.", "warning", event)
 
-    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used}
+    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used, "worst_dd": worst_dd, "worst_dd_used_percent": worst_dd_used}
+
+
+def account_output(a, t=None):
+    t = t or {}
+    return {
+        "id": t.get("id") or a.get("trader_id"),
+        "trader_id": a.get("trader_id") or t.get("id"),
+        "trader_account_id": a.get("id"),
+        "current_account_id": a.get("id"),
+        "name": t.get("name") or t.get("trader_name") or a.get("name") or "Trader",
+        "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or a.get("name") or "Trader",
+        "email": t.get("email") or a.get("email"),
+        "phone": t.get("phone") or a.get("phone") or "",
+        "phase": a.get("stage") or t.get("phase") or "phase1",
+        "stage": a.get("stage") or t.get("phase") or "phase1",
+        "status": "active",
+        "account_status": a.get("account_status") or "assigned_active",
+        "payment_status": "approved",
+        "monitoring_enabled": True,
+        "mt5_access_disabled": False,
+        "mt5_login": clean_login(a.get("mt5_login")),
+        "mt5_server": a.get("mt5_server") or "",
+        "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+        "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+        "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+        "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+        "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+        "account_size": num(a.get("account_size") or a.get("start_balance") or t.get("account_size") or t.get("balance")),
+        "balance": num(a.get("start_balance") or a.get("account_size") or t.get("account_size") or t.get("balance")),
+        "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size") or t.get("equity") or t.get("balance")),
+        "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
+        "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
+        "profit_percent": num(a.get("profit_percent")),
+        "risk_zone": a.get("risk_zone") or "safe",
+        "_source_of_truth": "monitoring_api",
+    }
 
 
 @app.route("/")
@@ -354,46 +432,69 @@ def health():
 
 @app.route("/monitorable_accounts")
 def monitorable_accounts():
-    """Fast endpoint for MT5 engine. One row per live MT5 account. No dashboard scans."""
+    """Fast endpoint for MT5 engine. One row per live MT5 account, including legacy active trader rows."""
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("account_status", "assigned_active").limit(MONITORABLE_LIMIT).execute().data or []
-        rows = [r for r in rows if valid_login(r.get("mt5_login")) and str(r.get("mt5_server") or "").strip()]
+        rows = []
+        try:
+            rows = supabase.table("trader_accounts").select("*").in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).limit(MONITORABLE_LIMIT).execute().data or []
+        except Exception:
+            raw = supabase.table("trader_accounts").select("*").limit(MONITORABLE_LIMIT).execute().data or []
+            rows = [r for r in raw if account_is_monitorable(r)]
+        rows = [r for r in rows if account_is_monitorable(r)]
+
         traders = fetch_traders_by_ids([r.get("trader_id") for r in rows])
         out = []
+        seen = set()
         for a in rows:
-            t = traders.get(str(a.get("trader_id")), {}) or {}
-            out.append({
-                "id": a.get("trader_id"),
-                "trader_id": a.get("trader_id"),
-                "trader_account_id": a.get("id"),
-                "current_account_id": a.get("id"),
-                "name": t.get("name") or t.get("trader_name") or "Trader",
-                "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
-                "email": t.get("email") or a.get("email"),
-                "phone": t.get("phone") or "",
-                "phase": a.get("stage") or t.get("phase") or "phase1",
-                "stage": a.get("stage") or t.get("phase") or "phase1",
-                "status": "active",
-                "account_status": a.get("account_status") or "assigned_active",
-                "payment_status": "approved",
-                "monitoring_enabled": True,
-                "mt5_access_disabled": False,
-                "mt5_login": clean_login(a.get("mt5_login")),
-                "mt5_server": a.get("mt5_server") or "",
-                "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
-                "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
-                "account_size": num(a.get("account_size") or a.get("start_balance")),
-                "balance": num(a.get("start_balance") or a.get("account_size")),
-                "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
-                "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
-                "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
-                "profit_percent": num(a.get("profit_percent")),
-                "risk_zone": a.get("risk_zone") or "safe",
-                "_source_of_truth": "monitoring_api",
-            })
+            login = clean_login(a.get("mt5_login"))
+            if login in seen:
+                continue
+            seen.add(login)
+            out.append(account_output(a, traders.get(str(a.get("trader_id")), {}) or {}))
+
+        # Legacy fallback: if admin/trader_dashboard has MT5 on the traders row but trader_accounts row is missing/wrong status,
+        # still feed it to the VPS engine. This fixes cases like a visible MT5 account missing from /monitorable_accounts.
+        try:
+            legacy = supabase.table("traders").select("*").limit(MONITORABLE_LIMIT).execute().data or []
+            for t in legacy:
+                login = clean_login(t.get("mt5_login"))
+                server = str(t.get("mt5_server") or "").strip()
+                status = str(t.get("status") or "").lower().strip()
+                payment = str(t.get("payment_status") or "").lower().strip()
+                if login in seen or not valid_login(login) or not server:
+                    continue
+                if t.get("mt5_access_disabled") is True or status in {"breached", "locked", "disabled"}:
+                    continue
+                if payment != "approved" and status not in {"active", "funded", "live"}:
+                    continue
+                a = {
+                    "id": None,
+                    "trader_id": t.get("id"),
+                    "email": t.get("email"),
+                    "phone": t.get("phone"),
+                    "name": t.get("name"),
+                    "stage": t.get("phase") or "phase1",
+                    "account_status": "assigned_active",
+                    "mt5_login": login,
+                    "mt5_server": server,
+                    "mt5_master_password": t.get("mt5_master_password") or t.get("mt5_password") or t.get("master_password") or "",
+                    "mt5_password": t.get("mt5_password") or t.get("mt5_master_password") or t.get("master_password") or "",
+                    "master_password": t.get("master_password") or t.get("mt5_master_password") or t.get("mt5_password") or "",
+                    "mt5_investor_password": t.get("mt5_investor_password") or t.get("investor_password") or "",
+                    "investor_password": t.get("investor_password") or t.get("mt5_investor_password") or "",
+                    "account_size": t.get("account_size") or t.get("balance"),
+                    "start_balance": t.get("account_size") or t.get("balance"),
+                    "current_equity": t.get("equity") or t.get("balance"),
+                    "current_balance": t.get("balance") or t.get("account_size"),
+                    "highest_equity": t.get("highest_equity") or t.get("equity") or t.get("balance"),
+                    "lowest_equity": t.get("lowest_equity") or t.get("equity") or t.get("balance"),
+                    "risk_zone": t.get("risk_zone") or "safe",
+                }
+                seen.add(login)
+                out.append(account_output(a, t))
+        except Exception as e:
+            print("LEGACY TRADER FALLBACK SKIPPED:", e)
+
         return ok(out, f"{len(out)} monitorable account(s)")
     except Exception as e:
         return bad(e, 500)
@@ -453,7 +554,6 @@ def sync_trades():
         row["updated_at"] = now_iso()
         if not row.get("created_at"):
             row["created_at"] = now_iso()
-        # Keep this fast. Upsert if DB has a suitable unique key, otherwise insert fallback.
         try:
             supabase.table("trader_trades").upsert(row, on_conflict="ticket,mt5_login").execute()
         except Exception:
@@ -469,15 +569,17 @@ def sync_trades():
 @app.route("/account_intelligence_scan")
 def account_intelligence_scan():
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("account_status", "assigned_active").limit(MONITORABLE_LIMIT).execute().data or []
+        rows = supabase.table("trader_accounts").select("*").in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).limit(MONITORABLE_LIMIT).execute().data or []
         results = []
         for account in rows:
             snapshot = {
                 "trader_account_id": account.get("id"),
                 "mt5_login": account.get("mt5_login"),
                 "equity": account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
+                "current_balance": account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
                 "highest_equity": account.get("highest_equity") or account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
                 "lowest_equity": account.get("lowest_equity") or account.get("start_balance") or account.get("account_size"),
+                "lowest_balance": account.get("lowest_balance") or account.get("start_balance") or account.get("account_size"),
                 "timestamp": now_iso(),
             }
             results.append(apply_intelligence(account, snapshot))
