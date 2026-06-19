@@ -553,29 +553,30 @@ def monitorable_accounts():
         except Exception as e:
             print("PURCHASE FALLBACK SKIPPED:", e)
 
-
-        # MT5 pool fallback: if assignment exists in mt5_pool but trader_accounts/traders/purchases have not synced yet,
-        # feed it to the VPS engine so fresh assignments start monitoring immediately.
+        # MT5 Pool fallback: any ASSIGNED/IN_USE pool account must be visible to the VPS engine
+        # even if trader_accounts or challenge_purchases were not written correctly.
+        # This specifically fixes fresh assignments that appear on dashboard/admin but not in /monitorable_accounts.
         try:
             pool_rows = supabase.table("mt5_pool").select("*").limit(MONITORABLE_LIMIT).execute().data or []
-            assigned_ids = [m.get("assigned_trader_id") for m in pool_rows if m.get("assigned_trader_id")]
-            pool_traders = fetch_traders_by_ids(assigned_ids)
+            trader_ids = [m.get("assigned_trader_id") or m.get("trader_id") for m in pool_rows if (m.get("assigned_trader_id") or m.get("trader_id"))]
+            traders_by_id = fetch_traders_by_ids(trader_ids)
             for m in pool_rows:
                 login = clean_login(m.get("mt5_login"))
-                server = str(m.get("mt5_server") or m.get("server") or "").strip()
-                status = str(m.get("status") or "").lower().strip()
+                server = str(m.get("mt5_server") or "").strip()
+                st = str(m.get("status") or "").lower().strip()
                 if login in seen or not valid_login(login) or not server:
                     continue
-                if not ("assign" in status or "use" in status or status in {"allocated", "in_use", "used"}):
+                if st not in {"assigned", "in_use", "active", "assigned_active", "used"}:
                     continue
-                t = pool_traders.get(str(m.get("assigned_trader_id")), {}) or {}
+                trader_id = m.get("assigned_trader_id") or m.get("trader_id")
+                t = traders_by_id.get(str(trader_id), {}) or {}
                 a = {
-                    "id": None,
-                    "trader_id": m.get("assigned_trader_id") or t.get("id"),
-                    "email": m.get("assigned_email") or t.get("email"),
-                    "phone": t.get("phone") or "",
-                    "name": m.get("assigned_trader_name") or t.get("name") or "Trader",
-                    "stage": m.get("assigned_phase") or t.get("phase") or "phase1",
+                    "id": m.get("trader_account_id") or m.get("current_account_id"),
+                    "trader_id": trader_id or t.get("id"),
+                    "email": m.get("assigned_email") or m.get("email") or t.get("email"),
+                    "phone": t.get("phone") or m.get("phone") or "",
+                    "name": m.get("assigned_trader_name") or m.get("trader_name") or t.get("name") or "Trader",
+                    "stage": m.get("assigned_phase") or m.get("phase") or t.get("phase") or "phase1",
                     "account_status": "assigned_active",
                     "mt5_login": login,
                     "mt5_server": server,
@@ -600,6 +601,99 @@ def monitorable_accounts():
         return ok(out, f"{len(out)} monitorable account(s)")
     except Exception as e:
         return bad(e, 500)
+
+
+@app.route("/debug_find_login/<login>")
+def debug_find_login(login):
+    login = clean_login(login)
+    found = {}
+    for table in ["trader_accounts", "traders", "challenge_purchases", "mt5_pool"]:
+        try:
+            found[table] = supabase.table(table).select("*").eq("mt5_login", login).limit(20).execute().data or []
+        except Exception as e:
+            found[table] = {"error": str(e)}
+    return ok(found, "debug login lookup")
+
+
+@app.route("/force_monitoring_sync")
+def force_monitoring_sync():
+    # Repair missing trader_accounts from already-assigned mt5_pool and approved purchases.
+    # It is safe: it does not delete anything and skips invalid logins/servers.
+    created = []
+    skipped = []
+    now = now_iso()
+
+    def ensure_account(source, r):
+        login = clean_login(r.get("mt5_login"))
+        server = str(r.get("mt5_server") or "").strip()
+        if not valid_login(login) or not server:
+            skipped.append({"source": source, "mt5_login": login, "reason": "invalid login/server"})
+            return
+        existing = []
+        try:
+            existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).limit(5).execute().data or []
+        except Exception as e:
+            skipped.append({"source": source, "mt5_login": login, "reason": "lookup failed", "error": str(e)})
+            return
+        if existing:
+            payload = {"account_status": "assigned_active", "monitoring_enabled": True, "mt5_access_disabled": False, "updated_at": now}
+            safe_update("trader_accounts", payload, "id", existing[0].get("id"))
+            created.append({"source": source, "mt5_login": login, "action": "reactivated_existing"})
+            return
+        trader_id = r.get("trader_id") or r.get("assigned_trader_id")
+        account_size = num(r.get("account_size") or r.get("start_balance") or r.get("balance") or 0)
+        payload = {
+            "trader_id": trader_id,
+            "purchase_id": r.get("purchase_id") or r.get("id") if source == "purchase" else None,
+            "mt5_pool_id": r.get("id") if source == "mt5_pool" else r.get("assigned_mt5_id"),
+            "stage": r.get("assigned_phase") or r.get("phase") or "phase1",
+            "account_status": "assigned_active",
+            "monitoring_enabled": True,
+            "mt5_access_disabled": False,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": r.get("mt5_master_password") or r.get("mt5_password") or r.get("master_password") or "",
+            "mt5_password": r.get("mt5_master_password") or r.get("mt5_password") or r.get("master_password") or "",
+            "master_password": r.get("mt5_master_password") or r.get("mt5_password") or r.get("master_password") or "",
+            "mt5_investor_password": r.get("mt5_investor_password") or r.get("investor_password") or "",
+            "investor_password": r.get("mt5_investor_password") or r.get("investor_password") or "",
+            "account_size": account_size,
+            "start_balance": account_size,
+            "current_balance": account_size,
+            "current_equity": account_size,
+            "highest_equity": account_size,
+            "lowest_equity": account_size,
+            "profit": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+            "risk_zone": "safe",
+            "assigned_at": r.get("assigned_at") or now,
+            "started_at": r.get("started_at") or r.get("assigned_at") or now,
+            "created_at": now,
+            "updated_at": now,
+        }
+        row = safe_insert("trader_accounts", payload)
+        created.append({"source": source, "mt5_login": login, "action": "inserted", "rows": len(row)})
+
+    try:
+        pool = supabase.table("mt5_pool").select("*").limit(MONITORABLE_LIMIT).execute().data or []
+        for m in pool:
+            st = str(m.get("status") or "").lower().strip()
+            if st in {"assigned", "in_use", "active", "assigned_active", "used"}:
+                ensure_account("mt5_pool", m)
+    except Exception as e:
+        skipped.append({"source": "mt5_pool", "error": str(e)})
+
+    try:
+        purchases = supabase.table("challenge_purchases").select("*").limit(MONITORABLE_LIMIT).execute().data or []
+        for p in purchases:
+            text = (str(p.get("status") or "") + " " + str(p.get("payment_status") or "")).lower()
+            if any(x in text for x in ["approved", "active", "assigned"]) and not any(x in text for x in ["rejected", "archived", "breached"]):
+                ensure_account("purchase", p)
+    except Exception as e:
+        skipped.append({"source": "purchase", "error": str(e)})
+
+    return ok({"created_or_repaired": created, "skipped": skipped}, "monitoring sync repaired")
 
 
 @app.route("/monitoring_snapshot", methods=["POST", "OPTIONS"])
@@ -666,160 +760,6 @@ def sync_trades():
                 continue
         saved += 1
     return ok({"received": len(trades), "saved": saved}, "trades synced")
-
-
-
-@app.route("/sync_monitoring_accounts", methods=["GET", "POST", "OPTIONS"])
-def sync_monitoring_accounts():
-    """Repair endpoint: creates missing trader_accounts rows from assigned traders, purchases and MT5 pool rows."""
-    if request.method == "OPTIONS":
-        return ok({})
-    synced = []
-    errors = []
-
-    def stage_for(row):
-        raw = str((row or {}).get("assigned_phase") or (row or {}).get("stage") or (row or {}).get("phase") or "phase1").lower().replace(" ", "")
-        if raw in {"funded/live", "funded_live", "funded", "live"}:
-            return "funded", "funded_active", 0
-        if raw in {"phase2", "phase_2"}:
-            return "phase2", "phase2_active", 8
-        return "phase1", "assigned_active", 10
-
-    def upsert_from(trader=None, source=None):
-        trader = trader or {}
-        source = source or {}
-        stage, account_status, target = stage_for(source or trader)
-        login = clean_login(source.get("mt5_login") or trader.get("mt5_login"))
-        server = str(source.get("mt5_server") or source.get("server") or trader.get("mt5_server") or trader.get("server") or "").strip()
-        trader_id = source.get("trader_id") or source.get("assigned_trader_id") or trader.get("id")
-        size = num(source.get("account_size") or source.get("start_balance") or trader.get("account_size") or trader.get("balance"))
-        if not trader_id or not valid_login(login) or not server or size <= 0:
-            return None
-        master = source.get("mt5_master_password") or source.get("mt5_password") or source.get("master_password") or trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password") or ""
-        investor = source.get("mt5_investor_password") or source.get("investor_password") or trader.get("mt5_investor_password") or trader.get("investor_password") or ""
-        payload = {
-            "trader_id": trader_id,
-            "account_reference": trader.get("account_reference") or source.get("account_reference"),
-            "account_size": size,
-            "start_balance": size,
-            "balance": size,
-            "current_balance": size,
-            "equity": size,
-            "current_equity": size,
-            "highest_equity": size,
-            "lowest_equity": size,
-            "lowest_balance": size,
-            "profit": 0,
-            "profit_percent": 0,
-            "current_profit": 0,
-            "current_profit_percent": 0,
-            "drawdown_percent": 0,
-            "absolute_drawdown_percent": 0,
-            "dd_used_percent": 0,
-            "max_drawdown_used": 0,
-            "risk_zone": "safe",
-            "stage": stage,
-            "phase": stage,
-            "account_status": account_status,
-            "status": "active",
-            "payment_status": "approved",
-            "monitoring_enabled": True,
-            "mt5_access_disabled": False,
-            "mt5_account_active": True,
-            "mt5_login": login,
-            "mt5_server": server,
-            "server": server,
-            "mt5_master_password": master,
-            "mt5_password": master,
-            "master_password": master,
-            "mt5_investor_password": investor,
-            "investor_password": investor,
-            "target_percent": target,
-            "profit_target": target,
-            "assigned_at": source.get("assigned_at") or trader.get("assigned_at") or now_iso(),
-            "started_at": source.get("assigned_at") or trader.get("challenge_started_at") or now_iso(),
-            "updated_at": now_iso(),
-            "admin_note": "Monitoring repair sync",
-            "approved_by": "sync",
-        }
-        try:
-            existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(1).execute().data or []
-        except Exception:
-            existing = []
-        if existing and existing[0].get("id"):
-            row = safe_update("trader_accounts", payload, "id", existing[0].get("id"))
-            out = row[0] if row else dict(existing[0], **payload)
-        else:
-            payload["created_at"] = now_iso()
-            row = safe_insert("trader_accounts", payload)
-            out = row[0] if row else payload
-        try:
-            safe_update("traders", {
-                "current_account_id": out.get("id"),
-                "trader_account_id": out.get("id"),
-                "mt5_login": login,
-                "mt5_server": server,
-                "mt5_master_password": master,
-                "mt5_password": master,
-                "master_password": master,
-                "mt5_investor_password": investor,
-                "investor_password": investor,
-                "account_size": size,
-                "balance": size,
-                "equity": size,
-                "phase": stage,
-                "status": "active" if stage == "phase1" else account_status,
-                "payment_status": "approved",
-                "monitoring_enabled": True,
-                "mt5_access_disabled": False,
-                "updated_at": now_iso(),
-            }, "id", trader_id)
-        except Exception:
-            pass
-        return out
-
-    try:
-        traders = supabase.table("traders").select("*").limit(MONITORABLE_LIMIT).execute().data or []
-        traders_by_id = {str(t.get("id")): t for t in traders if t.get("id")}
-    except Exception as e:
-        traders = []; traders_by_id = {}; errors.append(f"traders:{e}")
-
-    for t in traders:
-        status = str(t.get("status") or "").lower(); phase = str(t.get("phase") or "").lower()
-        if t.get("mt5_access_disabled") is True or any(x in status + " " + phase for x in ["breached", "archived", "locked", "disabled", "rejected"]):
-            continue
-        row = upsert_from(trader=t, source=t)
-        if row: synced.append(row.get("mt5_login"))
-
-    try:
-        purchases = supabase.table("challenge_purchases").select("*").limit(MONITORABLE_LIMIT).execute().data or []
-    except Exception as e:
-        purchases = []; errors.append(f"purchases:{e}")
-    for p in purchases:
-        state = str(p.get("status") or "").lower() + " " + str(p.get("payment_status") or "").lower()
-        if any(x in state for x in ["breached", "archived", "locked", "disabled", "rejected"]):
-            continue
-        if not any(x in state for x in ["approved", "active", "assigned"]):
-            continue
-        row = upsert_from(trader=traders_by_id.get(str(p.get("trader_id")), {}), source=p)
-        if row: synced.append(row.get("mt5_login"))
-
-    try:
-        pool = supabase.table("mt5_pool").select("*").limit(MONITORABLE_LIMIT).execute().data or []
-    except Exception as e:
-        pool = []; errors.append(f"mt5_pool:{e}")
-    for m in pool:
-        st = str(m.get("status") or "").lower()
-        if not ("assign" in st or "use" in st or st in {"allocated", "in_use", "used"}):
-            continue
-        row = upsert_from(trader=traders_by_id.get(str(m.get("assigned_trader_id")), {}), source=m)
-        if row: synced.append(row.get("mt5_login"))
-
-    unique=[]
-    for x in synced:
-        if x and x not in unique:
-            unique.append(x)
-    return ok({"synced_count": len(unique), "mt5_logins": unique, "errors": errors}, f"synced {len(unique)} account(s)")
 
 
 @app.route("/account_intelligence_scan")
