@@ -686,6 +686,11 @@ def monitorable_accounts():
     """Forensic live feed for MT5 VPS engine. Returns every assigned/live MT5 from all business sources."""
     try:
         include_remote = str(request.args.get("local_only") or "").lower() not in {"1", "true", "yes"}
+        
+        try:
+            _np_call_main_sync(request.args.get('force_logins',''))
+        except Exception as _e:
+            print('MAIN SYNC BEFORE FEED SKIPPED', _e)
         accounts = _np_forensic_monitoring_feed(include_remote=include_remote)
         return ok(accounts, f"{len(accounts)} monitorable account(s)")
     except Exception as e:
@@ -697,6 +702,11 @@ def sync_monitoring_accounts():
     if request.method == "OPTIONS":
         return ok({})
     try:
+        
+        try:
+            _np_call_main_sync(request.args.get('force_logins',''))
+        except Exception as _e:
+            print('MAIN SYNC BEFORE FORCE FEED SKIPPED', _e)
         accounts = _np_forensic_monitoring_feed(include_remote=True)
         return ok({"count": len(accounts), "accounts": accounts, "data": accounts}, f"{len(accounts)} account(s) visible to MT5 engine")
     except Exception as e:
@@ -806,6 +816,53 @@ def account_intelligence_scan():
     except Exception as e:
         return bad(e, 500)
 
+
+
+# ============================================================
+# NAIRAPIPS MONITORING API SYNC GATEWAY - FINAL
+# Pulls main API repair route before returning VPS feed.
+# ============================================================
+def _np_gateway_json(path, timeout=25):
+    try:
+        res = requests.get(MAIN_API_URL.rstrip('/') + path, timeout=timeout)
+        if res.status_code >= 400:
+            print('MAIN API GATEWAY HTTP', path, res.status_code, res.text[:200])
+            return None
+        return res.json()
+    except Exception as e:
+        print('MAIN API GATEWAY ERROR', path, e)
+        return None
+
+def _np_gateway_rows(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ['data','accounts','rows','visible','created','updated']:
+            val = payload.get(key)
+            if isinstance(val, list): return val
+            if isinstance(val, dict):
+                for k2 in ['accounts','visible','created','updated']:
+                    if isinstance(val.get(k2), list): return val.get(k2)
+    return []
+
+def _np_call_main_sync(force_logins=''):
+    suffix = '/np_unified_mt5_sync'
+    if force_logins:
+        suffix += '?force_logins=' + str(force_logins)
+    return _np_gateway_json(suffix, timeout=45)
+
+@app.route('/np_unified_mt5_sync', methods=['GET','POST','OPTIONS'])
+@app.route('/repair_monitorable_accounts', methods=['GET','POST','OPTIONS'])
+def monitoring_gateway_sync():
+    if request.method == 'OPTIONS':
+        return ok({})
+    force = request.args.get('force_logins','')
+    main = _np_call_main_sync(force)
+    try:
+        accounts = _np_forensic_monitoring_feed(include_remote=True) if '_np_forensic_monitoring_feed' in globals() else []
+    except Exception:
+        accounts = []
+    return ok({'main_sync': main, 'count': len(accounts), 'accounts': accounts, 'data': accounts}, f'{len(accounts)} account(s) visible to MT5 engine after sync')
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
