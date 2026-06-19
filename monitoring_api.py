@@ -19,8 +19,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ACTIVE_ACCOUNT_STATUSES = {
-    "assigned_active", "active", "current_active",
-    "phase1_active", "phase2_active", "funded_active", "live", "funded"
+    "assigned_active", "active", "current_active", "approved_active", "assigned",
+    "phase1", "phase1_active", "phase1_assigned",
+    "phase2", "phase2_active", "phase2_assigned",
+    "funded_active", "live", "funded"
 }
 TERMINAL_ACCOUNT_STATUSES = {
     "breached", "breached_archived", "archived_phase1", "archived_phase2",
@@ -112,13 +114,23 @@ def account_is_monitorable(row):
     if not row:
         return False
     status = str(row.get("account_status") or row.get("status") or "").lower().strip()
-    if status in TERMINAL_ACCOUNT_STATUSES:
+    phase = str(row.get("stage") or row.get("phase") or "").lower().strip()
+    combined = f"{status} {phase}"
+    if row.get("mt5_access_disabled") is True or row.get("monitoring_enabled") is False:
         return False
-    if status and status not in ACTIVE_ACCOUNT_STATUSES:
-        # Keep this strict enough to avoid archived/old accounts, but tolerant for missing statuses.
-        if "active" not in status and "assigned" not in status and status not in {"funded", "live"}:
-            return False
-    return valid_login(row.get("mt5_login")) and bool(str(row.get("mt5_server") or "").strip())
+    if any(x in combined for x in TERMINAL_ACCOUNT_STATUSES):
+        return False
+    if not valid_login(row.get("mt5_login")) or not str(row.get("mt5_server") or "").strip():
+        return False
+    # Any valid assigned/active phase account is monitorable, even if an older writer used
+    # status words like approved_active/new_signup on the trader row.
+    if not status:
+        return True
+    if status in ACTIVE_ACCOUNT_STATUSES or phase in ACTIVE_ACCOUNT_STATUSES:
+        return True
+    if any(x in combined for x in ["active", "assigned", "approved", "phase1", "phase2", "funded", "live", "new_signup"]):
+        return True
+    return False
 
 
 def fetch_traders_by_ids(ids):
@@ -465,8 +477,8 @@ def monitorable_accounts():
                     continue
                 if t.get("mt5_access_disabled") is True or status in {"breached", "locked", "disabled"}:
                     continue
-                if payment != "approved" and status not in {"active", "funded", "live"}:
-                    continue
+                # Any valid visible MT5 on the trader row is monitorable unless explicitly terminal.
+                # This covers new assignments where the dashboard already shows MT5 but status still says new_signup/approved_active.
                 a = {
                     "id": None,
                     "trader_id": t.get("id"),
@@ -494,6 +506,52 @@ def monitorable_accounts():
                 out.append(account_output(a, t))
         except Exception as e:
             print("LEGACY TRADER FALLBACK SKIPPED:", e)
+
+        # Purchase fallback: newest approved/assigned purchase with MT5 must also feed the VPS engine.
+        # This fixes fresh assignment cases where trader_accounts insertion is delayed/missing.
+        try:
+            purchases = supabase.table("challenge_purchases").select("*").limit(MONITORABLE_LIMIT).execute().data or []
+            trader_ids = [p.get("trader_id") for p in purchases if p.get("trader_id")]
+            traders_by_id = fetch_traders_by_ids(trader_ids)
+            for p in purchases:
+                login = clean_login(p.get("mt5_login"))
+                server = str(p.get("mt5_server") or "").strip()
+                st = str(p.get("status") or "").lower().strip()
+                pay = str(p.get("payment_status") or "").lower().strip()
+                if login in seen or not valid_login(login) or not server:
+                    continue
+                if any(x in (st + " " + pay) for x in ["breached", "archived", "locked", "disabled", "rejected"]):
+                    continue
+                if not ("approved" in st or "approved" in pay or "active" in st or "assigned" in st):
+                    continue
+                t = traders_by_id.get(str(p.get("trader_id")), {}) or {}
+                a = {
+                    "id": p.get("trader_account_id") or p.get("current_account_id"),
+                    "trader_id": p.get("trader_id") or t.get("id"),
+                    "email": p.get("email") or t.get("email"),
+                    "phone": p.get("phone") or t.get("phone") or "",
+                    "name": p.get("trader_name") or t.get("name") or "Trader",
+                    "stage": p.get("assigned_phase") or p.get("phase") or t.get("phase") or "phase1",
+                    "account_status": "assigned_active",
+                    "mt5_login": login,
+                    "mt5_server": server,
+                    "mt5_master_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or t.get("mt5_master_password") or t.get("mt5_password") or t.get("master_password") or "",
+                    "mt5_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or t.get("mt5_password") or "",
+                    "master_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or t.get("master_password") or "",
+                    "mt5_investor_password": p.get("mt5_investor_password") or p.get("investor_password") or t.get("mt5_investor_password") or t.get("investor_password") or "",
+                    "investor_password": p.get("mt5_investor_password") or p.get("investor_password") or t.get("investor_password") or "",
+                    "account_size": p.get("account_size") or t.get("account_size") or t.get("balance"),
+                    "start_balance": p.get("account_size") or t.get("account_size") or t.get("balance"),
+                    "current_equity": p.get("account_size") or t.get("equity") or t.get("balance"),
+                    "current_balance": p.get("account_size") or t.get("balance"),
+                    "highest_equity": p.get("account_size") or t.get("highest_equity") or t.get("equity") or t.get("balance"),
+                    "lowest_equity": p.get("account_size") or t.get("lowest_equity") or t.get("equity") or t.get("balance"),
+                    "risk_zone": "safe",
+                }
+                seen.add(login)
+                out.append(account_output(a, t))
+        except Exception as e:
+            print("PURCHASE FALLBACK SKIPPED:", e)
 
         return ok(out, f"{len(out)} monitorable account(s)")
     except Exception as e:
