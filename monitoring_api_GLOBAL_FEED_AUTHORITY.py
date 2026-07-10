@@ -53,6 +53,265 @@ def valid_login(v):
     return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL"]))
 
 
+ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active"}
+TERMINAL_ACCOUNT_WORDS = ("archived", "breached", "closed", "locked", "disabled", "passed", "reset")
+PURCHASE_BLOCK_WORDS = ("waiting", "reset", "archived", "breached", "disabled", "closed", "cancelled", "canceled", "rejected", "passed_review")
+POOL_ACTIVE_STATUSES = {"assigned", "active", "in_use", "used", "allocated", "assigned_active"}
+ACCOUNT_ORIGIN_FIELDS = ("account_origin", "source_type", "programme_type", "campaign_id", "grant_id", "referral_reward_id", "competition_id")
+NO_PURCHASE_AUDIT_KEYS = set()
+
+
+def is_active_monitoring_account(row):
+    status = str((row or {}).get("account_status") or (row or {}).get("status") or "").strip().lower()
+    if not row or status not in ACTIVE_ACCOUNT_STATUSES:
+        return False
+    if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
+        return False
+    if (row or {}).get("archived_at") or (row or {}).get("reset_at"):
+        return False
+    if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"}:
+        return False
+    return valid_login((row or {}).get("mt5_login"))
+
+
+def bool_false(value):
+    return str(value).strip().lower() in {"false", "0", "no", "off"}
+
+
+def bool_true(value):
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def lifecycle_blob(row, keys):
+    return " ".join(str((row or {}).get(k) or "").strip().lower() for k in keys)
+
+
+def account_origin(account):
+    return {key: (account or {}).get(key) for key in ACCOUNT_ORIGIN_FIELDS if (account or {}).get(key) not in (None, "")}
+
+
+def log_lifecycle_inconsistency(reason, account=None, purchase=None, mt5_pool=None, trader=None):
+    evidence = {
+        "reason": reason,
+        "trader_id": (account or {}).get("trader_id") or (purchase or {}).get("trader_id") or (trader or {}).get("id"),
+        "trader_account_id": (account or {}).get("id") or (purchase or {}).get("trader_account_id"),
+        "purchase_id": (account or {}).get("purchase_id") or (purchase or {}).get("id"),
+        "mt5_login": clean_login((account or {}).get("mt5_login") or (purchase or {}).get("mt5_login")),
+        "account_status": (account or {}).get("account_status"),
+        "purchase_status": (purchase or {}).get("status"),
+        "purchase_lifecycle_state": (purchase or {}).get("lifecycle_state"),
+        "pool_status": (mt5_pool or {}).get("status"),
+        "trader_state": (trader or {}).get("challenge_state") or (trader or {}).get("status"),
+        "account_origin": account_origin(account),
+    }
+    print("MONITORING LIFECYCLE INCONSISTENCY:", evidence, flush=True)
+    try:
+        safe_insert("monitoring_events", {
+            "trader_id": evidence["trader_id"],
+            "trader_account_id": evidence["trader_account_id"],
+            "mt5_login": evidence["mt5_login"],
+            "event_type": "lifecycle_inconsistency",
+            "risk_zone": "investigate",
+            "message": reason,
+            "payload": evidence,
+            "created_at": now_iso(),
+        })
+    except Exception:
+        pass
+
+
+def log_no_purchase_monitoring_allowed(account):
+    key = str((account or {}).get("id") or "")
+    if not key or key in NO_PURCHASE_AUDIT_KEYS:
+        return
+    NO_PURCHASE_AUDIT_KEYS.add(key)
+    reason = "active account has no purchase_id; monitoring allowed from exact trader_account evidence"
+    evidence = {
+        "reason": reason,
+        "trader_id": (account or {}).get("trader_id"),
+        "trader_account_id": (account or {}).get("id"),
+        "purchase_id": None,
+        "mt5_login": clean_login((account or {}).get("mt5_login")),
+        "account_status": (account or {}).get("account_status"),
+        "account_origin": account_origin(account),
+    }
+    print("MONITORING NO-PURCHASE ACCOUNT ALLOWED:", evidence, flush=True)
+    try:
+        safe_insert("monitoring_events", {
+            "trader_id": evidence["trader_id"],
+            "trader_account_id": evidence["trader_account_id"],
+            "mt5_login": evidence["mt5_login"],
+            "event_type": "monitoring_allowed_no_purchase_id",
+            "risk_zone": "audit",
+            "message": reason,
+            "payload": evidence,
+            "created_at": now_iso(),
+        })
+    except Exception:
+        pass
+
+
+def is_active_purchase_for_account(purchase, account):
+    if not purchase:
+        return False, "linked purchase not found"
+    if str(purchase.get("id") or "") != str((account or {}).get("purchase_id") or ""):
+        return False, "purchase_id mismatch"
+    if str(purchase.get("trader_id") or "") != str((account or {}).get("trader_id") or ""):
+        return False, "purchase trader_id mismatch"
+    purchase_account_id = str(purchase.get("trader_account_id") or "").strip()
+    if purchase_account_id and purchase_account_id != str((account or {}).get("id") or ""):
+        return False, "purchase linked to a different trader_account_id"
+    purchase_login = clean_login(purchase.get("mt5_login"))
+    account_login = clean_login((account or {}).get("mt5_login"))
+    if purchase_login and purchase_login != account_login:
+        return False, "purchase mt5_login mismatch"
+    purchase_pool_id = str(purchase.get("mt5_pool_id") or purchase.get("assigned_mt5_id") or "").strip()
+    account_pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    if purchase_pool_id and account_pool_id and purchase_pool_id != account_pool_id:
+        return False, "purchase mt5_pool_id mismatch"
+    blob = lifecycle_blob(purchase, ["status", "payment_status", "lifecycle_state", "stage", "phase", "admin_note"])
+    if any(word in blob for word in PURCHASE_BLOCK_WORDS):
+        return False, "purchase lifecycle is not monitorable"
+    return True, "purchase active"
+
+
+def is_active_pool_for_account(mt5_pool, account):
+    pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    if not pool_id:
+        return True, "no mt5_pool_id on account"
+    if not mt5_pool:
+        return False, "linked mt5_pool row not found"
+    status = str(mt5_pool.get("status") or "").strip().lower()
+    if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
+        return False, "mt5_pool is terminal"
+    if status and status not in POOL_ACTIVE_STATUSES:
+        return False, "mt5_pool status is not active"
+    pool_account_id = str(mt5_pool.get("trader_account_id") or "").strip()
+    if pool_account_id and pool_account_id != str((account or {}).get("id") or ""):
+        return False, "mt5_pool linked to a different trader_account_id"
+    pool_trader_id = str(mt5_pool.get("assigned_trader_id") or mt5_pool.get("trader_id") or "").strip()
+    if pool_trader_id and pool_trader_id != str((account or {}).get("trader_id") or ""):
+        return False, "mt5_pool linked to a different trader"
+    pool_login = clean_login(mt5_pool.get("mt5_login"))
+    account_login = clean_login((account or {}).get("mt5_login"))
+    if pool_login and pool_login != account_login:
+        return False, "mt5_pool mt5_login mismatch"
+    return True, "mt5_pool active"
+
+
+def monitoring_eligibility(account, purchase=None, mt5_pool=None, trader=None, require_server=True):
+    if not is_active_monitoring_account(account):
+        return False, "account is not monitorable"
+    if require_server and not str((account or {}).get("mt5_server") or "").strip():
+        return False, "account has no mt5_server"
+    if bool_false((account or {}).get("monitoring_enabled")):
+        return False, "account monitoring_enabled is false"
+    if bool_true((account or {}).get("mt5_access_disabled")):
+        return False, "account mt5_access_disabled is true"
+    if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
+        return False, "account is superseded"
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    if purchase_id:
+        ok_purchase, reason = is_active_purchase_for_account(purchase, account)
+        if not ok_purchase:
+            return False, reason
+    ok_pool, reason = is_active_pool_for_account(mt5_pool, account)
+    if not ok_pool:
+        return False, reason
+    if trader:
+        t_blob = lifecycle_blob(trader, ["challenge_state", "status", "phase"])
+        if any(word in t_blob for word in ("waiting", "reset", "breached", "archived", "disabled", "closed", "passed_review")):
+            log_lifecycle_inconsistency("trader-level lifecycle disagrees with eligible active account; account remains monitorable", account, purchase, mt5_pool, trader)
+    if not purchase_id:
+        log_no_purchase_monitoring_allowed(account)
+    return True, "eligible"
+
+
+def fetch_trader_by_id(trader_id):
+    try:
+        if not trader_id:
+            return {}
+        rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("TRADER FETCH ERROR:", e)
+        return {}
+
+
+def fetch_purchase_by_id(purchase_id):
+    try:
+        if not purchase_id:
+            return {}
+        rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("PURCHASE FETCH ERROR:", e)
+        return {}
+
+
+def fetch_pool_by_id(pool_id):
+    try:
+        if not pool_id:
+            return {}
+        rows = supabase.table("mt5_pool").select("*").eq("id", pool_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 POOL FETCH ERROR:", e)
+        return {}
+
+
+def account_is_eligible(account, caches=None, require_server=True):
+    caches = caches if isinstance(caches, dict) else {}
+    purchases = caches.setdefault("purchases", {})
+    pools = caches.setdefault("pools", {})
+    traders = caches.setdefault("traders", {})
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    trader_id = str((account or {}).get("trader_id") or "").strip()
+    if purchase_id and purchase_id not in purchases:
+        purchases[purchase_id] = fetch_purchase_by_id(purchase_id)
+    if pool_id and pool_id not in pools:
+        pools[pool_id] = fetch_pool_by_id(pool_id)
+    if trader_id and trader_id not in traders:
+        traders[trader_id] = fetch_trader_by_id(trader_id)
+    eligible, reason = monitoring_eligibility(
+        account,
+        purchases.get(purchase_id) or {},
+        pools.get(pool_id) or {},
+        traders.get(trader_id) or {},
+        require_server=require_server,
+    )
+    if not eligible:
+        log_lifecycle_inconsistency(reason, account, purchases.get(purchase_id) or {}, pools.get(pool_id) or {}, traders.get(trader_id) or {})
+    return eligible, reason
+
+
+def eligible_accounts_without_login_ambiguity(rows, context="monitoring"):
+    caches = {}
+    eligible_rows = []
+    by_login = {}
+    for row in rows or []:
+        eligible, _reason = account_is_eligible(row, caches)
+        if not eligible:
+            continue
+        login = clean_login(row.get("mt5_login"))
+        by_login.setdefault(login, []).append(row)
+    for login, group in by_login.items():
+        if len(group) == 1:
+            eligible_rows.append(group[0])
+            continue
+        for row in group:
+            log_lifecycle_inconsistency(
+                "mt5_login resolves to multiple eligible active accounts; exact trader_account_id required",
+                row,
+                caches.get("purchases", {}).get(str(row.get("purchase_id") or "").strip()) or {},
+                caches.get("pools", {}).get(str(row.get("mt5_pool_id") or "").strip()) or {},
+                caches.get("traders", {}).get(str(row.get("trader_id") or "").strip()) or {},
+            )
+            print(f"MONITORING {context.upper()} EXCLUDED AMBIGUOUS LOGIN:", {"mt5_login": login, "trader_account_id": row.get("id")}, flush=True)
+    return eligible_rows
+
+
 def target_for_stage(stage):
     stage = str(stage or "").strip().lower()
     if stage == "phase1":
@@ -119,18 +378,35 @@ def fetch_traders_by_ids(ids):
 
 
 def get_account_by_id_or_login(account_id=None, mt5_login=None):
+    caches = {}
     try:
         if account_id:
             rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
-            if rows:
+            account = rows[0] if rows else None
+            if not account:
+                return None
+            login = clean_login(mt5_login)
+            if login and clean_login(account.get("mt5_login")) != login:
+                log_lifecycle_inconsistency("snapshot/trade supplied trader_account_id but mt5_login does not match", account)
+                return None
+            eligible, _reason = account_is_eligible(account, caches)
+            if eligible:
                 return rows[0]
+            return None
         login = clean_login(mt5_login)
         if login:
             rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(10).execute().data or []
+            eligible_rows = []
             for r in rows:
-                if str(r.get("account_status") or "").lower() in {"assigned_active", "active", "current_active"}:
-                    return r
-            return rows[0] if rows else None
+                eligible, _reason = account_is_eligible(r, caches)
+                if eligible:
+                    eligible_rows.append(r)
+            if len(eligible_rows) == 1:
+                return eligible_rows[0]
+            if len(eligible_rows) > 1:
+                for r in eligible_rows:
+                    log_lifecycle_inconsistency("mt5_login resolves to multiple eligible active accounts; exact trader_account_id required", r)
+                return None
     except Exception as e:
         print("ACCOUNT FETCH ERROR:", e)
     return None
@@ -190,6 +466,9 @@ def alert_once(account, event_type, title, message, severity="info", snapshot=No
 def apply_intelligence(account, snapshot):
     if not account:
         return None
+    if not is_active_monitoring_account(account):
+        print("MONITORING SNAPSHOT IGNORED FOR NON-ACTIVE ACCOUNT:", {"account_id": account.get("id"), "trader_id": account.get("trader_id"), "mt5_login": account.get("mt5_login"), "account_status": account.get("account_status")}, flush=True)
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "ignored": True, "reason": "account_not_active_for_monitoring"}
 
     start = num(account.get("start_balance") or account.get("account_size") or snapshot.get("balance") or 0)
     equity = num(snapshot.get("equity") or snapshot.get("current_equity") or account.get("current_equity") or start)
@@ -356,11 +635,16 @@ def health():
 def monitorable_accounts():
     """Fast endpoint for MT5 engine. One row per live MT5 account. No dashboard scans."""
     try:
-        try:
-            rows = supabase.table("trader_accounts").select("*").in_("account_status", ["assigned_active", "active", "current_active"]).limit(MONITORABLE_LIMIT).execute().data or []
-        except Exception:
-            rows = supabase.table("trader_accounts").select("*").eq("account_status", "assigned_active").limit(MONITORABLE_LIMIT).execute().data or []
-        rows = [r for r in rows if valid_login(r.get("mt5_login")) and str(r.get("mt5_server") or "").strip()]
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+            .limit(MONITORABLE_LIMIT)
+            .execute()
+            .data
+            or []
+        )
+        rows = [r for r in eligible_accounts_without_login_ambiguity(rows, "monitorable_accounts") if str(r.get("mt5_server") or "").strip()]
         traders = fetch_traders_by_ids([r.get("trader_id") for r in rows])
         out = []
         for a in rows:
@@ -449,10 +733,26 @@ def sync_trades():
     if not isinstance(trades, list):
         return bad("trades must be a list")
     saved = 0
+    skipped = 0
+    account_cache = {}
     for trade in trades[:500]:
         if not isinstance(trade, dict):
             continue
         row = dict(trade)
+        lookup_id = row.get("trader_account_id") or row.get("current_account_id")
+        lookup_login = row.get("mt5_login") or data.get("mt5_login")
+        cache_key = f"{lookup_id or ''}:{clean_login(lookup_login)}"
+        account = account_cache.get(cache_key)
+        if cache_key not in account_cache:
+            account = get_account_by_id_or_login(lookup_id, lookup_login)
+            account_cache[cache_key] = account
+        if not account:
+            skipped += 1
+            print("TRADE SYNC SKIPPED NON-ACTIVE ACCOUNT:", {"trader_account_id": lookup_id, "mt5_login": clean_login(lookup_login)}, flush=True)
+            continue
+        row["trader_id"] = account.get("trader_id")
+        row["trader_account_id"] = account.get("id")
+        row["mt5_login"] = clean_login(account.get("mt5_login"))
         row["synced_at"] = now_iso()
         row["updated_at"] = now_iso()
         if not row.get("created_at"):
@@ -467,7 +767,7 @@ def sync_trades():
                 print("TRADE SAVE SKIPPED:", e)
                 continue
         saved += 1
-    return ok({"received": len(trades), "saved": saved}, "trades synced")
+    return ok({"received": len(trades), "saved": saved, "skipped_non_active": skipped}, "trades synced")
 
 
 @app.route("/traders")
@@ -502,17 +802,36 @@ def trader_current_account_compat(lookup):
                 accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).limit(50).execute().data or []
         elif lookup.isdigit():
             accounts = supabase.table("trader_accounts").select("*").eq("mt5_login", lookup).order("updated_at", desc=True).limit(50).execute().data or []
-            if accounts:
-                trs = supabase.table("traders").select("*").eq("id", accounts[0].get("trader_id")).limit(1).execute().data or []
-                trader = trs[0] if trs else None
         else:
             trs = supabase.table("traders").select("*").eq("id", lookup).limit(1).execute().data or []
             trader = trs[0] if trs else None
             if trader:
                 accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).limit(50).execute().data or []
-        active_states = {"assigned_active", "active", "current_active"}
-        active_accounts = [a for a in accounts if str(a.get("account_status") or "").lower() in active_states]
-        current = active_accounts[0] if active_accounts else (accounts[0] if accounts else None)
+        caches = {}
+        if trader and trader.get("id"):
+            caches.setdefault("traders", {})[str(trader.get("id"))] = trader
+        active_accounts = [a for a in accounts if account_is_eligible(a, caches)[0]]
+        current = None
+        if lookup.isdigit():
+            if len(active_accounts) == 1:
+                current = active_accounts[0]
+                trader_id = current.get("trader_id")
+                if trader_id:
+                    trs = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+                    trader = trs[0] if trs else None
+            elif len(active_accounts) > 1:
+                trader = None
+                for row in active_accounts:
+                    log_lifecycle_inconsistency(
+                        "mt5_login resolves to multiple eligible active accounts; exact trader_account_id required",
+                        row,
+                        caches.get("purchases", {}).get(str(row.get("purchase_id") or "").strip()) or {},
+                        caches.get("pools", {}).get(str(row.get("mt5_pool_id") or "").strip()) or {},
+                        caches.get("traders", {}).get(str(row.get("trader_id") or "").strip()) or {},
+                    )
+            # Never guess between duplicate eligible rows for a login-only lookup.
+        else:
+            current = active_accounts[0] if active_accounts else None
         return ok({"source_of_truth": "trader_accounts", "trader": trader or {}, "current_account": current, "active_accounts": active_accounts, "accounts": accounts}, "global feed account loaded")
     except Exception as e:
         return bad(e, 500)
@@ -521,10 +840,16 @@ def trader_current_account_compat(lookup):
 @app.route("/account_intelligence_scan")
 def account_intelligence_scan():
     try:
-        try:
-            rows = supabase.table("trader_accounts").select("*").in_("account_status", ["assigned_active", "active", "current_active"]).limit(MONITORABLE_LIMIT).execute().data or []
-        except Exception:
-            rows = supabase.table("trader_accounts").select("*").eq("account_status", "assigned_active").limit(MONITORABLE_LIMIT).execute().data or []
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+            .limit(MONITORABLE_LIMIT)
+            .execute()
+            .data
+            or []
+        )
+        rows = eligible_accounts_without_login_ambiguity(rows, "account_intelligence_scan")
         results = []
         for account in rows:
             snapshot = {
