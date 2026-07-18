@@ -650,7 +650,10 @@ def monitorable_accounts():
         for a in rows:
             t = traders.get(str(a.get("trader_id")), {}) or {}
             out.append({
-                "id": a.get("trader_id"),
+                # Account-scoped identity: one trader may legitimately own many
+                # simultaneous active challenge accounts. Never use trader_id as
+                # the row identity or downstream consumers may collapse them.
+                "id": a.get("id"),
                 "trader_id": a.get("trader_id"),
                 "trader_account_id": a.get("id"),
                 "current_account_id": a.get("id"),
@@ -691,9 +694,12 @@ def monitoring_snapshot():
     if request.method == "OPTIONS":
         return ok({})
     data = request.get_json(silent=True) or {}
-    account = get_account_by_id_or_login(data.get("trader_account_id") or data.get("current_account_id"), data.get("mt5_login"))
+    account_id = data.get("trader_account_id") or data.get("current_account_id")
+    if not account_id:
+        return bad("Exact trader_account_id is required for snapshot", 400)
+    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
     if not account:
-        return bad("Account not found for snapshot", 404)
+        return bad("Active account not found or ownership evidence mismatched", 404)
     result = apply_intelligence(account, data)
     print(f"GLOBAL_FEED SNAPSHOT APPLIED mt5={data.get('mt5_login')} result={result}", flush=True)
     return ok(result, "snapshot applied")
@@ -704,9 +710,12 @@ def disable_mt5_access():
     if request.method == "OPTIONS":
         return ok({})
     data = request.get_json(silent=True) or {}
-    account = get_account_by_id_or_login(data.get("trader_account_id") or data.get("current_account_id"), data.get("mt5_login"))
+    account_id = data.get("trader_account_id") or data.get("current_account_id")
+    if not account_id:
+        return bad("Exact trader_account_id is required", 400)
+    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
     if not account:
-        return bad("Account not found", 404)
+        return bad("Active account not found or ownership evidence mismatched", 404)
     status = str(data.get("status") or "breached").lower()
     reason = data.get("reason") or "MT5 access disabled by monitoring engine"
     payload = {
@@ -739,8 +748,12 @@ def sync_trades():
         if not isinstance(trade, dict):
             continue
         row = dict(trade)
-        lookup_id = row.get("trader_account_id") or row.get("current_account_id")
+        lookup_id = row.get("trader_account_id") or row.get("current_account_id") or data.get("trader_account_id") or data.get("current_account_id")
         lookup_login = row.get("mt5_login") or data.get("mt5_login")
+        if not lookup_id:
+            skipped += 1
+            print("TRADE SYNC SKIPPED WITHOUT EXACT ACCOUNT ID:", {"mt5_login": clean_login(lookup_login)}, flush=True)
+            continue
         cache_key = f"{lookup_id or ''}:{clean_login(lookup_login)}"
         account = account_cache.get(cache_key)
         if cache_key not in account_cache:
