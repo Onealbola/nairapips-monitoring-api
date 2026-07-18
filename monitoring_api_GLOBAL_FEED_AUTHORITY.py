@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import os, re
 
 app = Flask(__name__)
+NAIRAPIPS_RELEASE = "LIFECYCLE_COORDINATED_R2"
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
