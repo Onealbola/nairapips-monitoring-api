@@ -601,6 +601,14 @@ def apply_intelligence(account, snapshot):
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
         "message": snapshot.get("reason") or "Monitoring snapshot applied",
+        "intelligence_version": "NIC_SPRINT1",
+        "intelligence_event_id": f"{account.get('id')}:{snapshot.get('timestamp') or now_iso()}",
+        "starting_balance": start,
+        "current_balance": num(snapshot.get("balance"), start),
+        "current_equity": equity,
+        "drawdown_amount": max(0, start - min(num(snapshot.get("balance"), start), equity)),
+        "drawdown_remaining_percent": max(0, MAX_DD_PERCENT - current_dd),
+        "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
         "created_at": now_iso(),
     }
     safe_insert("monitoring_events", event)
