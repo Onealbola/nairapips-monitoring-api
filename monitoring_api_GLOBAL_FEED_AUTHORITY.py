@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import os, re
 
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "CURRENT_MT5_BALANCE_AUTHORITY_FINAL_2026_07_23"
+NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -471,24 +471,56 @@ def apply_intelligence(account, snapshot):
         print("MONITORING SNAPSHOT IGNORED FOR NON-ACTIVE ACCOUNT:", {"account_id": account.get("id"), "trader_id": account.get("trader_id"), "mt5_login": account.get("mt5_login"), "account_status": account.get("account_status")}, flush=True)
         return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "ignored": True, "reason": "account_not_active_for_monitoring"}
 
-    start = num(account.get("start_balance") or account.get("account_size") or snapshot.get("balance") or 0)
-    current_balance = num(
-        snapshot.get("current_balance")
-        if snapshot.get("current_balance") not in (None, "")
-        else snapshot.get("balance")
-        if snapshot.get("balance") not in (None, "")
-        else account.get("current_balance")
-        if account.get("current_balance") not in (None, "")
-        else start
+    start = num(
+        account.get("start_balance")
+        or account.get("account_size")
+        or snapshot.get("starting_balance")
+        or snapshot.get("initial_balance")
+        or snapshot.get("balance")
+        or 0
     )
+
+    # MT5 bridges do not all use the same field names. Normalize every known
+    # live-balance/equity alias before applying intelligence.
+    raw_balance = next((
+        snapshot.get(key)
+        for key in (
+            "current_balance", "balance", "account_balance", "Balance",
+            "ACCOUNT_BALANCE", "mt5_balance", "live_balance"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
+
+    raw_closed_profit = next((
+        snapshot.get(key)
+        for key in (
+            "closed_profit", "closed_pnl", "realized_profit",
+            "realised_profit", "net_closed_profit"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
+
+    if raw_balance not in (None, ""):
+        current_balance = num(raw_balance, start)
+    elif raw_closed_profit not in (None, "") and start:
+        current_balance = round(start + num(raw_closed_profit), 2)
+    else:
+        current_balance = num(account.get("current_balance"), start)
+
+    raw_equity = next((
+        snapshot.get(key)
+        for key in (
+            "current_equity", "equity", "account_equity", "Equity",
+            "ACCOUNT_EQUITY", "mt5_equity", "live_equity"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
     equity = num(
-        snapshot.get("current_equity")
-        if snapshot.get("current_equity") not in (None, "")
-        else snapshot.get("equity")
-        if snapshot.get("equity") not in (None, "")
+        raw_equity if raw_equity not in (None, "")
         else account.get("current_equity")
         if account.get("current_equity") not in (None, "")
-        else current_balance
+        else current_balance,
+        current_balance
     )
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
     target = target_for_stage(stage)
@@ -510,8 +542,8 @@ def apply_intelligence(account, snapshot):
     dd_remaining = round(max(MAX_DD_PERCENT - current_dd, 0), 2)
     zone = risk_zone(current_dd)
 
-    # Closed/current profit is based on the live MT5 balance.
-    # highest_equity remains separate evidence for target/pass auditing.
+    # Current payout/closed profit follows the actual MT5 balance.
+    # highest_equity remains pass-target evidence only.
     profit = round(current_balance - start, 2) if start else 0.0
     profit_percent = round((profit / start) * 100, 2) if start else 0.0
     current_profit = profit
@@ -900,10 +932,7 @@ def account_intelligence_scan():
             snapshot = {
                 "trader_account_id": account.get("id"),
                 "mt5_login": account.get("mt5_login"),
-                "balance": account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
-                "current_balance": account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
-                "equity": account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
-                "current_equity": account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
+                "equity": account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
                 "highest_equity": account.get("highest_equity") or account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
                 "lowest_equity": account.get("lowest_equity") or account.get("start_balance") or account.get("account_size"),
                 "timestamp": now_iso(),
