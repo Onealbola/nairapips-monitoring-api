@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import os, re
 
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "LIFECYCLE_COORDINATED_R2"
+NAIRAPIPS_RELEASE = "LIVE_METRIC_PRECEDENCE_FIXED_2026_07_23"
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -556,7 +556,7 @@ def apply_intelligence(account, snapshot):
 
     trader_update = {
         "equity": equity,
-        "balance": start,
+        "balance": num(snapshot.get("balance") or account.get("current_balance") or start),
         "profit": profit,
         "profit_percent": profit_percent,
         "drawdown_percent": current_dd,
@@ -583,7 +583,7 @@ def apply_intelligence(account, snapshot):
         "risk_zone": zone,
         "phase_label": stage,
         "phase_pass_status": phase_pass_status,
-        "balance": start,
+        "balance": num(snapshot.get("balance") or account.get("current_balance") or start),
         "equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
