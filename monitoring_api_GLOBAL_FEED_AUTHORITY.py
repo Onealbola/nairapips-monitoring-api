@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import os, re
 
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "LIVE_METRIC_PRECEDENCE_FIXED_2026_07_23"
+NAIRAPIPS_RELEASE = "CURRENT_MT5_BALANCE_AUTHORITY_FINAL_2026_07_23"
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -472,7 +472,24 @@ def apply_intelligence(account, snapshot):
         return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "ignored": True, "reason": "account_not_active_for_monitoring"}
 
     start = num(account.get("start_balance") or account.get("account_size") or snapshot.get("balance") or 0)
-    equity = num(snapshot.get("equity") or snapshot.get("current_equity") or account.get("current_equity") or start)
+    current_balance = num(
+        snapshot.get("current_balance")
+        if snapshot.get("current_balance") not in (None, "")
+        else snapshot.get("balance")
+        if snapshot.get("balance") not in (None, "")
+        else account.get("current_balance")
+        if account.get("current_balance") not in (None, "")
+        else start
+    )
+    equity = num(
+        snapshot.get("current_equity")
+        if snapshot.get("current_equity") not in (None, "")
+        else snapshot.get("equity")
+        if snapshot.get("equity") not in (None, "")
+        else account.get("current_equity")
+        if account.get("current_equity") not in (None, "")
+        else current_balance
+    )
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
     target = target_for_stage(stage)
     breach_level = round(start * (1 - MAX_DD_PERCENT / 100), 2) if start else 0.0
@@ -493,10 +510,13 @@ def apply_intelligence(account, snapshot):
     dd_remaining = round(max(MAX_DD_PERCENT - current_dd, 0), 2)
     zone = risk_zone(current_dd)
 
-    profit = round(highest - start, 2) if start else 0.0
+    # Closed/current profit is based on the live MT5 balance.
+    # highest_equity remains separate evidence for target/pass auditing.
+    profit = round(current_balance - start, 2) if start else 0.0
     profit_percent = round((profit / start) * 100, 2) if start else 0.0
-    current_profit = round(equity - start, 2) if start else 0.0
-    current_profit_percent = round((current_profit / start) * 100, 2) if start else 0.0
+    current_profit = profit
+    current_profit_percent = profit_percent
+    floating_profit = round(equity - current_balance, 2)
     target_equity = round(start * (1 + target / 100), 2) if target else 0.0
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
@@ -520,7 +540,7 @@ def apply_intelligence(account, snapshot):
         next_phase = stage
 
     update = {
-        "current_balance": num(snapshot.get("balance") or account.get("current_balance") or start),
+        "current_balance": current_balance,
         "current_equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
@@ -556,7 +576,7 @@ def apply_intelligence(account, snapshot):
 
     trader_update = {
         "equity": equity,
-        "balance": num(snapshot.get("balance") or account.get("current_balance") or start),
+        "balance": current_balance,
         "profit": profit,
         "profit_percent": profit_percent,
         "drawdown_percent": current_dd,
@@ -583,7 +603,7 @@ def apply_intelligence(account, snapshot):
         "risk_zone": zone,
         "phase_label": stage,
         "phase_pass_status": phase_pass_status,
-        "balance": num(snapshot.get("balance") or account.get("current_balance") or start),
+        "balance": current_balance,
         "equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
@@ -604,9 +624,10 @@ def apply_intelligence(account, snapshot):
         "intelligence_version": "NIC_SPRINT1",
         "intelligence_event_id": f"{account.get('id')}:{snapshot.get('timestamp') or now_iso()}",
         "starting_balance": start,
-        "current_balance": num(snapshot.get("balance"), start),
+        "current_balance": current_balance,
         "current_equity": equity,
-        "drawdown_amount": max(0, start - min(num(snapshot.get("balance"), start), equity)),
+        "floating_profit": floating_profit,
+        "drawdown_amount": max(0, start - min(current_balance, equity)),
         "drawdown_remaining_percent": max(0, MAX_DD_PERCENT - current_dd),
         "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
         "created_at": now_iso(),
@@ -685,8 +706,10 @@ def monitorable_accounts():
                 "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
                 "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
                 "account_size": num(a.get("account_size") or a.get("start_balance")),
-                "balance": num(a.get("start_balance") or a.get("account_size")),
+                "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+                "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
                 "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+                "current_equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
                 "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
                 "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
                 "profit_percent": num(a.get("profit_percent")),
@@ -877,7 +900,10 @@ def account_intelligence_scan():
             snapshot = {
                 "trader_account_id": account.get("id"),
                 "mt5_login": account.get("mt5_login"),
-                "equity": account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
+                "balance": account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
+                "current_balance": account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
+                "equity": account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
+                "current_equity": account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size"),
                 "highest_equity": account.get("highest_equity") or account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
                 "lowest_equity": account.get("lowest_equity") or account.get("start_balance") or account.get("account_size"),
                 "timestamp": now_iso(),
