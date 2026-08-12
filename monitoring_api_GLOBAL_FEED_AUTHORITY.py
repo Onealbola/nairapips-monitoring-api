@@ -114,7 +114,6 @@ def log_lifecycle_inconsistency(reason, account=None, purchase=None, mt5_pool=No
             "event_type": "lifecycle_inconsistency",
             "risk_zone": "investigate",
             "message": reason,
-            "payload": evidence,
             "created_at": now_iso(),
         })
     except Exception:
@@ -145,7 +144,6 @@ def log_no_purchase_monitoring_allowed(account):
             "event_type": "monitoring_allowed_no_purchase_id",
             "risk_zone": "audit",
             "message": reason,
-            "payload": evidence,
             "created_at": now_iso(),
         })
     except Exception:
