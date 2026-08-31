@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import os, re
 
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
+NAIRAPIPS_RELEASE = "BREACH_WINS_PLAN_RULES_2026_08_31"
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -333,15 +333,16 @@ def waiting_after_pass(stage):
     return "passed_review", stage or "phase1"
 
 
-def risk_zone(current_dd_percent):
-    d = num(current_dd_percent)
-    if d >= 20:
+def risk_zone_from_used(dd_used_percent):
+    """Risk bands based on percentage of the account's own DD allowance consumed."""
+    used = num(dd_used_percent)
+    if used >= 100:
         return "breached"
-    if d >= 18:
+    if used >= 90:
         return "critical"
-    if d >= 15:
+    if used >= 75:
         return "danger"
-    if d >= 10:
+    if used >= 50:
         return "warning"
     return "safe"
 
@@ -354,10 +355,11 @@ def static_dd(start_balance, equity):
     return round(max(((start - eq) / start) * 100, 0.0), 2)
 
 
-def dd_used_from_static(dd_percent):
-    if MAX_DD_PERCENT <= 0:
+def dd_used_from_static(dd_percent, dd_limit_percent):
+    limit = num(dd_limit_percent, MAX_DD_PERCENT)
+    if limit <= 0:
         return 0.0
-    return round(max((num(dd_percent) / MAX_DD_PERCENT) * 100, 0.0), 2)
+    return round(max((num(dd_percent) / limit) * 100, 0.0), 2)
 
 
 def fetch_traders_by_ids(ids):
@@ -521,8 +523,14 @@ def apply_intelligence(account, snapshot):
         current_balance
     )
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
-    target = target_for_stage(stage)
-    breach_level = round(start * (1 - MAX_DD_PERCENT / 100), 2) if start else 0.0
+
+    # Every account carries its own commercial rules. Never apply one global DD
+    # or old 10/8 target to all products.
+    dd_limit = num(account.get("dd_limit_percent"), MAX_DD_PERCENT) or MAX_DD_PERCENT
+    target = num(account.get("target_percent"), target_for_stage(stage))
+    if stage == "funded":
+        target = 0.0
+    breach_level = round(start * (1 - dd_limit / 100), 2) if start else 0.0
 
     old_high = num(account.get("highest_equity") or start)
     old_low = num(account.get("lowest_equity") or start)
@@ -534,11 +542,11 @@ def apply_intelligence(account, snapshot):
     lowest = round(min(low_candidates), 2) if low_candidates else equity
 
     current_dd = static_dd(start, equity)
-    current_dd_used = dd_used_from_static(current_dd)
+    current_dd_used = dd_used_from_static(current_dd, dd_limit)
     worst_dd = static_dd(start, lowest)
-    worst_dd_used = dd_used_from_static(worst_dd)
-    dd_remaining = round(max(MAX_DD_PERCENT - current_dd, 0), 2)
-    zone = risk_zone(current_dd)
+    worst_dd_used = dd_used_from_static(worst_dd, dd_limit)
+    dd_remaining = round(max(dd_limit - current_dd, 0), 2)
+    zone = risk_zone_from_used(current_dd_used)
 
     # Current payout/closed profit follows the actual MT5 balance.
     # highest_equity remains pass-target evidence only.
@@ -550,24 +558,33 @@ def apply_intelligence(account, snapshot):
     target_equity = round(start * (1 + target / 100), 2) if target else 0.0
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
-    target_hit = bool(target and highest >= target_equity and profit_percent >= target)
-    breached = bool((not target_hit) and start and equity <= breach_level)
+    # BREACH ALWAYS WINS. Historical lowest equity is terminal evidence too:
+    # recovery after touching the DD limit cannot turn a breached account into PASSED.
+    breached = bool(
+        start and (
+            equity <= breach_level
+            or lowest <= breach_level
+            or current_dd_used >= 100
+            or worst_dd_used >= 100
+        )
+    )
+    target_hit = bool((not breached) and target and highest >= target_equity and profit_percent >= target)
 
     status = str(account.get("account_status") or "assigned_active").lower()
     phase_pass_status = ""
     lifecycle_state = None
     next_phase = stage
 
-    if target_hit:
-        zone = "passed"
-        phase_pass_status = f"{stage}_passed"
-        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
-        lifecycle_state, next_phase = waiting_after_pass(stage)
-    elif breached:
+    if breached:
         zone = "breached"
         status = "breached_archived"
         lifecycle_state = "breached"
         next_phase = stage
+    elif target_hit:
+        zone = "passed"
+        phase_pass_status = f"{stage}_passed"
+        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
+        lifecycle_state, next_phase = waiting_after_pass(stage)
 
     update = {
         "current_balance": current_balance,
@@ -586,6 +603,7 @@ def apply_intelligence(account, snapshot):
         "worst_dd_used_percent": worst_dd_used,
         "dd_remaining_percent": dd_remaining,
         "breach_equity_level": breach_level,
+        "dd_limit_percent": dd_limit,
         "target_percent": target,
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
@@ -658,7 +676,7 @@ def apply_intelligence(account, snapshot):
         "current_equity": equity,
         "floating_profit": floating_profit,
         "drawdown_amount": max(0, start - min(current_balance, equity)),
-        "drawdown_remaining_percent": max(0, MAX_DD_PERCENT - current_dd),
+        "drawdown_remaining_percent": max(0, dd_limit - current_dd),
         "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
         "created_at": now_iso(),
     }
@@ -675,7 +693,7 @@ def apply_intelligence(account, snapshot):
         alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting next-stage MT5 assignment.", "success", event)
     elif breached:
         alert_once(account, "breached", "ACCOUNT BREACHED", f"MT5 {account.get('mt5_login')} equity {equity} hit/below breach level {breach_level}.", "critical", event)
-    elif current_dd >= 10:
+    elif current_dd_used >= 50:
         alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}%.", "warning", event)
 
     return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used}
