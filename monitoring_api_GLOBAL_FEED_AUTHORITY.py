@@ -7,6 +7,7 @@ import os, re
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
+NAIRAPIPS_MONITORING_RELEASE = "BUSINESS_RULE_AUTHORITY_2026_08_31"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -311,6 +312,138 @@ def eligible_accounts_without_login_ambiguity(rows, context="monitoring"):
     return eligible_rows
 
 
+
+_RULE_CACHE = {}
+_RULE_CACHE_SECONDS = 60
+
+def fetch_plan_by_id(plan_id):
+    try:
+        if not plan_id:
+            return {}
+        rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("PLAN FETCH ERROR:", e)
+        return {}
+
+def _rule_cache_get(key):
+    row = _RULE_CACHE.get(key)
+    if not row:
+        return None
+    ts, value = row
+    if time.time() - ts > _RULE_CACHE_SECONDS:
+        _RULE_CACHE.pop(key, None)
+        return None
+    return value
+
+def _rule_cache_set(key, value):
+    _RULE_CACHE[key] = (time.time(), value)
+    return value
+
+def resolve_account_rules(account, stage=None):
+    """Resolve exact commercial rules for THIS trader_account.
+
+    Priority:
+      1) frozen trader_accounts values,
+      2) linked challenge purchase,
+      3) linked challenge plan,
+      4) legacy defaults.
+
+    This keeps legacy accounts at their own stored/default rules while allowing
+    2-Lives/current plans to use 10% DD and their configured Phase 1 target.
+    """
+    account = account or {}
+    stage = str(stage or account.get("stage") or "phase1").strip().lower()
+    cache_key = "rules:" + str(account.get("id") or account.get("mt5_login") or "")
+    cached = _rule_cache_get(cache_key)
+    if cached:
+        return dict(cached)
+
+    purchase = {}
+    plan = {}
+    purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+    if purchase_id:
+        purchase = fetch_purchase_by_id(purchase_id) or {}
+
+    plan_id = str(
+        account.get("plan_id")
+        or purchase.get("plan_id")
+        or purchase.get("challenge_plan_id")
+        or ""
+    ).strip()
+    if plan_id:
+        plan = fetch_plan_by_id(plan_id) or {}
+
+    def first_num(*values):
+        for v in values:
+            if v not in (None, ""):
+                n = num(v, None)
+                if n is not None and n > 0:
+                    return float(n)
+        return None
+
+    # Drawdown is static from starting balance, but the percentage is plan/account specific.
+    dd_limit = first_num(
+        account.get("dd_limit_percent"),
+        account.get("max_drawdown"),
+        purchase.get("max_drawdown"),
+        purchase.get("dd_limit_percent"),
+        plan.get("max_drawdown"),
+        plan.get("total_dd"),
+    )
+    if not dd_limit:
+        dd_limit = float(MAX_DD_PERCENT or 20)
+
+    if stage == "phase1":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            purchase.get("phase1_target"),
+            purchase.get("profit_target"),
+            plan.get("phase1_target"),
+            plan.get("profit_target"),
+        ) or 10.0
+    elif stage == "phase2":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            purchase.get("phase2_target"),
+            plan.get("phase2_target"),
+        ) or 8.0
+    else:
+        target = 0.0
+
+    second_life_enabled = bool_true(
+        purchase.get("second_life_enabled")
+        if purchase.get("second_life_enabled") is not None
+        else plan.get("second_life_enabled")
+    )
+
+    # Current 2-Lives product is a one-phase challenge: a valid Phase 1 PASS goes Funded.
+    # Old/legacy plans keep the old Phase1 -> Phase2 progression.
+    one_phase = second_life_enabled
+    journey_text = " ".join(str(x or "") for x in (
+        account.get("challenge_journey"),
+        purchase.get("challenge_journey"),
+        purchase.get("journey_stages"),
+        purchase.get("route"),
+        plan.get("challenge_journey"),
+        plan.get("journey_stages"),
+    )).lower()
+    if "one_phase" in journey_text or "1-phase" in journey_text or "1 phase" in journey_text:
+        one_phase = True
+
+    rules = {
+        "dd_limit_percent": float(dd_limit),
+        "target_percent": float(target),
+        "second_life_enabled": bool(second_life_enabled),
+        "one_phase": bool(one_phase),
+        "purchase_id": purchase_id or None,
+        "plan_id": plan_id or None,
+        "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"),
+    }
+    return _rule_cache_set(cache_key, rules)
+
 def target_for_stage(stage):
     stage = str(stage or "").strip().lower()
     if stage == "phase1":
@@ -333,15 +466,18 @@ def waiting_after_pass(stage):
     return "passed_review", stage or "phase1"
 
 
-def risk_zone(current_dd_percent):
+def risk_zone(current_dd_percent, dd_limit_percent=None):
     d = num(current_dd_percent)
-    if d >= 20:
+    limit = num(dd_limit_percent, MAX_DD_PERCENT or 20)
+    if limit <= 0:
+        limit = 20.0
+    if d >= limit:
         return "breached"
-    if d >= 18:
+    if d >= limit * 0.90:
         return "critical"
-    if d >= 15:
+    if d >= limit * 0.75:
         return "danger"
-    if d >= 10:
+    if d >= limit * 0.50:
         return "warning"
     return "safe"
 
@@ -354,10 +490,11 @@ def static_dd(start_balance, equity):
     return round(max(((start - eq) / start) * 100, 0.0), 2)
 
 
-def dd_used_from_static(dd_percent):
-    if MAX_DD_PERCENT <= 0:
+def dd_used_from_static(dd_percent, dd_limit_percent=None):
+    limit = num(dd_limit_percent, MAX_DD_PERCENT or 20)
+    if limit <= 0:
         return 0.0
-    return round(max((num(dd_percent) / MAX_DD_PERCENT) * 100, 0.0), 2)
+    return round(max((num(dd_percent) / limit) * 100, 0.0), 2)
 
 
 def fetch_traders_by_ids(ids):
@@ -521,8 +658,10 @@ def apply_intelligence(account, snapshot):
         current_balance
     )
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
-    target = target_for_stage(stage)
-    breach_level = round(start * (1 - MAX_DD_PERCENT / 100), 2) if start else 0.0
+    rules = resolve_account_rules(account, stage)
+    target = num(rules.get("target_percent"), target_for_stage(stage))
+    dd_limit_percent = num(rules.get("dd_limit_percent"), MAX_DD_PERCENT or 20)
+    breach_level = round(start * (1 - dd_limit_percent / 100), 2) if start else 0.0
 
     old_high = num(account.get("highest_equity") or start)
     old_low = num(account.get("lowest_equity") or start)
@@ -534,11 +673,11 @@ def apply_intelligence(account, snapshot):
     lowest = round(min(low_candidates), 2) if low_candidates else equity
 
     current_dd = static_dd(start, equity)
-    current_dd_used = dd_used_from_static(current_dd)
+    current_dd_used = dd_used_from_static(current_dd, dd_limit_percent)
     worst_dd = static_dd(start, lowest)
-    worst_dd_used = dd_used_from_static(worst_dd)
-    dd_remaining = round(max(MAX_DD_PERCENT - current_dd, 0), 2)
-    zone = risk_zone(current_dd)
+    worst_dd_used = dd_used_from_static(worst_dd, dd_limit_percent)
+    dd_remaining = round(max(dd_limit_percent - current_dd, 0), 2)
+    zone = risk_zone(current_dd, dd_limit_percent)
 
     # Current payout/closed profit follows the actual MT5 balance.
     # highest_equity remains pass-target evidence only.
@@ -551,23 +690,34 @@ def apply_intelligence(account, snapshot):
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
     target_hit = bool(target and highest >= target_equity and profit_percent >= target)
-    breached = bool((not target_hit) and start and equity <= breach_level)
+
+    # TERMINAL EVENT AUTHORITY:
+    # A real static DD breach must never be erased because the account also touched
+    # its profit target. Use the worst evidence seen while this account is still live.
+    breached_by_equity = bool(start and equity <= breach_level)
+    breached_by_balance = bool(start and current_balance <= breach_level)
+    breached_by_recorded_low = bool(start and lowest <= breach_level)
+    breached = bool(breached_by_equity or breached_by_balance or breached_by_recorded_low)
 
     status = str(account.get("account_status") or "assigned_active").lower()
     phase_pass_status = ""
     lifecycle_state = None
     next_phase = stage
 
-    if target_hit:
-        zone = "passed"
-        phase_pass_status = f"{stage}_passed"
-        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
-        lifecycle_state, next_phase = waiting_after_pass(stage)
-    elif breached:
+    if breached:
         zone = "breached"
         status = "breached_archived"
         lifecycle_state = "breached"
         next_phase = stage
+        phase_pass_status = ""
+    elif target_hit:
+        zone = "passed"
+        phase_pass_status = f"{stage}_passed"
+        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
+        if stage == "phase1" and rules.get("one_phase"):
+            lifecycle_state, next_phase = "funded_waiting_mt5", "funded"
+        else:
+            lifecycle_state, next_phase = waiting_after_pass(stage)
 
     update = {
         "current_balance": current_balance,
@@ -598,8 +748,17 @@ def apply_intelligence(account, snapshot):
         update["account_status"] = status
         update["monitoring_enabled"] = False
         update["archived_at"] = now_iso()
-        update["archive_reason"] = snapshot.get("reason") or ("Target reached" if target_hit else "Static drawdown breached")
-        if target_hit:
+        update["archive_reason"] = snapshot.get("reason") or ("Static drawdown breached" if breached else "Target reached")
+        if breached:
+            update["breached_at"] = account.get("breached_at") or now_iso()
+            update["breach_reason"] = snapshot.get("reason") or (
+                f"Static {dd_limit_percent:g}% drawdown breached. "
+                f"Lowest/current evidence reached {min(lowest, equity, current_balance):,.2f} "
+                f"against breach level {breach_level:,.2f}."
+            )
+            update["phase_pass_status"] = ""
+            update["passed_at"] = None
+        elif target_hit:
             update["passed_at"] = now_iso()
 
     safe_update("trader_accounts", update, "id", account.get("id"))
@@ -617,7 +776,7 @@ def apply_intelligence(account, snapshot):
         trader_update.update({
             "challenge_state": lifecycle_state,
             "phase": next_phase,
-            "status": "active" if target_hit else "breached",
+            "status": "breached" if breached else "active",
             "mt5_access_disabled": True,
             "monitoring_enabled": False,
             "phase_pass_status": phase_pass_status,
@@ -629,7 +788,7 @@ def apply_intelligence(account, snapshot):
         "trader_id": account.get("trader_id"),
         "trader_account_id": account.get("id"),
         "mt5_login": clean_login(account.get("mt5_login") or snapshot.get("mt5_login")),
-        "event_type": "phase_passed" if target_hit else ("breached" if breached else "snapshot"),
+        "event_type": "breached" if breached else ("phase_passed" if target_hit else "snapshot"),
         "risk_zone": zone,
         "phase_label": stage,
         "phase_pass_status": phase_pass_status,
@@ -658,7 +817,8 @@ def apply_intelligence(account, snapshot):
         "current_equity": equity,
         "floating_profit": floating_profit,
         "drawdown_amount": max(0, start - min(current_balance, equity)),
-        "drawdown_remaining_percent": max(0, MAX_DD_PERCENT - current_dd),
+        "drawdown_remaining_percent": max(0, dd_limit_percent - current_dd),
+        "dd_limit_percent": dd_limit_percent,
         "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
         "created_at": now_iso(),
     }
@@ -671,12 +831,17 @@ def apply_intelligence(account, snapshot):
     except Exception:
         pass
 
-    if target_hit:
-        alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting next-stage MT5 assignment.", "success", event)
-    elif breached:
-        alert_once(account, "breached", "ACCOUNT BREACHED", f"MT5 {account.get('mt5_login')} equity {equity} hit/below breach level {breach_level}.", "critical", event)
-    elif current_dd >= 10:
-        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}%.", "warning", event)
+    if breached:
+        alert_once(
+            account, "breached", "ACCOUNT BREACHED",
+            f"MT5 {account.get('mt5_login')} hit/below its static {dd_limit_percent:g}% DD level {breach_level:,.2f}.",
+            "critical", event
+        )
+    elif target_hit:
+        next_label = "Funded" if (stage == "phase1" and rules.get("one_phase")) else "next-stage"
+        alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting {next_label} MT5 assignment.", "success", event)
+    elif current_dd >= dd_limit_percent * 0.50:
+        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}% of a {dd_limit_percent:g}% limit.", "warning", event)
 
     return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used}
 
@@ -736,6 +901,8 @@ def monitorable_accounts():
                 "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
                 "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
                 "account_size": num(a.get("account_size") or a.get("start_balance")),
+                "dd_limit_percent": num(resolve_account_rules(a, a.get("stage")).get("dd_limit_percent"), MAX_DD_PERCENT or 20),
+                "target_percent": num(resolve_account_rules(a, a.get("stage")).get("target_percent"), target_for_stage(a.get("stage"))),
                 "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
                 "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
                 "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
