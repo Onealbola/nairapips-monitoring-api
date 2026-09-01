@@ -7,7 +7,7 @@ import os, re
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "MONITORING_HEALTH_RADAR_2026_09_01"
+NAIRAPIPS_MONITORING_RELEASE = "FAST_DISCOVERY_WORKER_TIMEOUT_FIX_2026_09_01"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -963,65 +963,254 @@ def monitoring_health():
         return bad(e, 500)
 
 
-@app.route("/monitorable_accounts")
-def monitorable_accounts():
-    """Fast endpoint for MT5 engine. One row per live MT5 account. No dashboard scans."""
+
+def _bulk_rows(table_name, ids, select="*"):
+    """One bounded Supabase query for a set of IDs. Never N+1 inside discovery."""
+    clean_ids = [str(x).strip() for x in (ids or []) if str(x or "").strip()]
+    if not clean_ids:
+        return {}
+    # preserve order while deduplicating
+    clean_ids = list(dict.fromkeys(clean_ids))
     try:
         rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
-            .limit(MONITORABLE_LIMIT)
+            supabase.table(table_name)
+            .select(select)
+            .in_("id", clean_ids)
             .execute()
             .data
             or []
         )
-        rows = [r for r in eligible_accounts_without_login_ambiguity(rows, "monitorable_accounts") if str(r.get("mt5_server") or "").strip()]
-        traders = fetch_traders_by_ids([r.get("trader_id") for r in rows])
-        out = []
-        for a in rows:
-            t = traders.get(str(a.get("trader_id")), {}) or {}
-            out.append({
-                # Account-scoped identity: one trader may legitimately own many
-                # simultaneous active challenge accounts. Never use trader_id as
-                # the row identity or downstream consumers may collapse them.
-                "id": a.get("id"),
-                "trader_id": a.get("trader_id"),
-                "trader_account_id": a.get("id"),
-                "current_account_id": a.get("id"),
-                "name": t.get("name") or t.get("trader_name") or "Trader",
-                "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
-                "email": t.get("email") or a.get("email"),
-                "phone": t.get("phone") or "",
-                "phase": a.get("stage") or t.get("phase") or "phase1",
-                "stage": a.get("stage") or t.get("phase") or "phase1",
-                "status": "active",
-                "account_status": a.get("account_status") or "assigned_active",
-                "payment_status": "approved",
-                "monitoring_enabled": True,
-                "mt5_access_disabled": False,
-                "mt5_login": clean_login(a.get("mt5_login")),
-                "mt5_server": a.get("mt5_server") or "",
-                "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
-                "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
-                "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
-                "account_size": num(a.get("account_size") or a.get("start_balance")),
-                "dd_limit_percent": num(resolve_account_rules(a, a.get("stage")).get("dd_limit_percent"), MAX_DD_PERCENT or 20),
-                "target_percent": num(resolve_account_rules(a, a.get("stage")).get("target_percent"), target_for_stage(a.get("stage"))),
-                "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
-                "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
-                "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
-                "current_equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
-                "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
-                "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
-                "profit_percent": num(a.get("profit_percent")),
-                "risk_zone": a.get("risk_zone") or "safe",
-                "_source_of_truth": "monitoring_api",
-            })
+        return {str(r.get("id")): r for r in rows if r.get("id")}
+    except Exception as e:
+        print(f"FAST DISCOVERY BULK FETCH ERROR table={table_name}: {e}", flush=True)
+        return {}
+
+
+def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
+    """Exact account safety checks without writes, alerts or per-row DB queries.
+
+    Discovery must stay read-only and fast. Lifecycle disagreements are handled by
+    lifecycle/event processing elsewhere; they must never make Gunicorn time out.
+    """
+    if not is_active_monitoring_account(account):
+        return False, "account is not monitorable"
+    if not str((account or {}).get("mt5_server") or "").strip():
+        return False, "account has no mt5_server"
+    if bool_false((account or {}).get("monitoring_enabled")):
+        return False, "account monitoring_enabled is false"
+    if bool_true((account or {}).get("mt5_access_disabled")):
+        return False, "account mt5_access_disabled is true"
+    if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
+        return False, "account is superseded"
+
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    if purchase_id:
+        ok_purchase, reason = is_active_purchase_for_account(purchase or {}, account)
+        if not ok_purchase:
+            return False, reason
+
+    ok_pool, reason = is_active_pool_for_account(mt5_pool or {}, account)
+    if not ok_pool:
+        return False, reason
+
+    return True, "eligible"
+
+
+def _fast_rule_values(account, purchase=None, plan=None):
+    """Resolve monitoring rules from frozen account values first, then purchase/plan.
+
+    This is deliberately pure/read-only: no Supabase calls are allowed here.
+    """
+    account = account or {}
+    purchase = purchase or {}
+    plan = plan or {}
+    stage = str(account.get("stage") or account.get("phase") or "phase1").strip().lower()
+
+    def first_num(*values):
+        for v in values:
+            if v not in (None, ""):
+                n = num(v, None)
+                if n is not None and n > 0:
+                    return float(n)
+        return None
+
+    dd_limit = first_num(
+        account.get("dd_limit_percent"),
+        account.get("max_drawdown"),
+        purchase.get("dd_limit_percent"),
+        purchase.get("max_drawdown"),
+        plan.get("max_drawdown"),
+        plan.get("total_dd"),
+    ) or float(MAX_DD_PERCENT or 20)
+
+    if stage == "phase1":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            purchase.get("phase1_target"),
+            purchase.get("profit_target"),
+            plan.get("phase1_target"),
+            plan.get("profit_target"),
+        ) or 10.0
+    elif stage == "phase2":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            purchase.get("phase2_target"),
+            plan.get("phase2_target"),
+        ) or 8.0
+    else:
+        target = 0.0
+
+    return float(dd_limit), float(target)
+
+
+def _fast_monitorable_feed():
+    """Production-critical MT5 discovery path.
+
+    Maximum normal DB work:
+      1 trader_accounts query
+      1 challenge_purchases bulk query
+      1 mt5_pool bulk query
+      1 traders bulk query
+      1 challenge_plans bulk query
+
+    No per-account queries. No monitoring_events writes. No lifecycle reconciliation.
+    """
+    rows = (
+        supabase.table("trader_accounts")
+        .select("*")
+        .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+        .limit(MONITORABLE_LIMIT)
+        .execute()
+        .data
+        or []
+    )
+
+    # Cheapest account-level safety first.
+    base = []
+    for a in rows:
+        if not is_active_monitoring_account(a):
+            continue
+        if not str(a.get("mt5_server") or "").strip():
+            continue
+        if bool_false(a.get("monitoring_enabled")) or bool_true(a.get("mt5_access_disabled")):
+            continue
+        if a.get("superseded_at") or a.get("replaced_at") or bool_true(a.get("superseded")):
+            continue
+        base.append(a)
+
+    purchase_map = _bulk_rows("challenge_purchases", [a.get("purchase_id") for a in base])
+    pool_map = _bulk_rows("mt5_pool", [a.get("mt5_pool_id") for a in base])
+
+    eligible = []
+    excluded = []
+    for a in base:
+        purchase = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        pool = pool_map.get(str(a.get("mt5_pool_id") or "")) or {}
+        ok, reason = _quiet_monitoring_eligibility(a, purchase, pool)
+        if ok:
+            eligible.append(a)
+        else:
+            excluded.append((a, reason))
+
+    # Exact-login ambiguity remains a hard safety exclusion, but logging is console-only.
+    by_login = {}
+    for a in eligible:
+        by_login.setdefault(clean_login(a.get("mt5_login")), []).append(a)
+
+    clean = []
+    ambiguous = 0
+    for login, group in by_login.items():
+        if login and len(group) == 1:
+            clean.append(group[0])
+        else:
+            ambiguous += len(group)
+            print(
+                "FAST DISCOVERY EXCLUDED AMBIGUOUS LOGIN:",
+                {"mt5_login": login, "account_ids": [r.get("id") for r in group]},
+                flush=True,
+            )
+
+    trader_map = _bulk_rows("traders", [a.get("trader_id") for a in clean])
+
+    # Plan lookup is also bulk and only used as fallback when account/purchase does not
+    # already carry frozen commercial rules.
+    plan_ids = []
+    for a in clean:
+        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
+        if plan_id:
+            plan_ids.append(plan_id)
+    plan_map = _bulk_rows("challenge_plans", plan_ids)
+
+    out = []
+    for a in clean:
+        t = trader_map.get(str(a.get("trader_id") or "")) or {}
+        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
+        plan = plan_map.get(str(plan_id or "")) or {}
+        dd_limit, target = _fast_rule_values(a, p, plan)
+
+        out.append({
+            "id": a.get("id"),
+            "trader_id": a.get("trader_id"),
+            "trader_account_id": a.get("id"),
+            "current_account_id": a.get("id"),
+            "name": t.get("name") or t.get("trader_name") or "Trader",
+            "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
+            "email": t.get("email") or a.get("email"),
+            "phone": t.get("phone") or "",
+            "phase": a.get("stage") or t.get("phase") or "phase1",
+            "stage": a.get("stage") or t.get("phase") or "phase1",
+            "status": "active",
+            "account_status": a.get("account_status") or "assigned_active",
+            "payment_status": "approved",
+            "monitoring_enabled": True,
+            "mt5_access_disabled": False,
+            "mt5_login": clean_login(a.get("mt5_login")),
+            "mt5_server": a.get("mt5_server") or "",
+            "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+            "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+            "account_size": num(a.get("account_size") or a.get("start_balance")),
+            "dd_limit_percent": dd_limit,
+            "target_percent": target,
+            "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "current_equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
+            "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
+            "profit_percent": num(a.get("profit_percent")),
+            "risk_zone": a.get("risk_zone") or "safe",
+            "_source_of_truth": "monitoring_api_fast_discovery",
+        })
+
+    print(
+        "FAST DISCOVERY COMPLETE:",
+        {
+            "active_rows": len(rows),
+            "base_eligible": len(base),
+            "monitorable": len(out),
+            "excluded": len(excluded),
+            "ambiguous": ambiguous,
+        },
+        flush=True,
+    )
+    return out
+
+
+@app.route("/monitorable_accounts")
+def monitorable_accounts():
+    """Fast, read-only discovery endpoint for the Windows MT5 engine."""
+    try:
+        out = _fast_monitorable_feed()
         return ok(out, f"{len(out)} monitorable account(s)")
     except Exception as e:
+        print("FAST DISCOVERY FATAL ERROR:", repr(e), flush=True)
         return bad(e, 500)
 
 
