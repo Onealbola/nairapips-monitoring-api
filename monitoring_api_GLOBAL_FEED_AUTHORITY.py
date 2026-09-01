@@ -1,3 +1,4 @@
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
@@ -7,7 +8,7 @@ import os, re
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "FAST_DISCOVERY_WORKER_TIMEOUT_FIX_2026_09_01"
+NAIRAPIPS_MONITORING_RELEASE = "FAST_DISCOVERY_SNAPSHOT_TIME_IMPORT_FIX_2026_09_01"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
