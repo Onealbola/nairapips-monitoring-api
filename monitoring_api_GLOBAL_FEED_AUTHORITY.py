@@ -7,7 +7,7 @@ import os, re
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "BUSINESS_RULE_AUTHORITY_2026_08_31"
+NAIRAPIPS_MONITORING_RELEASE = "MONITORING_HEALTH_RADAR_2026_09_01"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -851,9 +851,116 @@ def home():
     return ok({"service": "NairaPips Monitoring API", "status": "live"})
 
 
+def _parse_iso_ts(v):
+    if not v:
+        return None
+    try:
+        s = str(v).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _monitoring_freshness_payload(stale_after_seconds=180):
+    now = datetime.now(timezone.utc)
+    rows = (
+        supabase.table("trader_accounts")
+        .select("id,trader_id,mt5_login,stage,account_status,last_sync_at,updated_at,current_balance,current_equity")
+        .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+        .limit(MONITORABLE_LIMIT)
+        .execute()
+        .data
+        or []
+    )
+    active = []
+    stale = []
+    never = []
+    newest = None
+    for r in rows:
+        if not str(r.get("mt5_server") or "").strip():
+            # Some schemas/queries may not include server in this lightweight health query.
+            pass
+        ts = _parse_iso_ts(r.get("last_sync_at"))
+        age = None
+        if ts:
+            age = max(0, int((now - ts).total_seconds()))
+            if newest is None or ts > newest:
+                newest = ts
+        item = {
+            "trader_account_id": r.get("id"),
+            "trader_id": r.get("trader_id"),
+            "mt5_login": r.get("mt5_login"),
+            "stage": r.get("stage"),
+            "account_status": r.get("account_status"),
+            "last_sync_at": r.get("last_sync_at"),
+            "sync_age_seconds": age,
+            "current_balance": r.get("current_balance"),
+            "current_equity": r.get("current_equity"),
+        }
+        active.append(item)
+        if not ts:
+            never.append(item)
+        elif age is not None and age > stale_after_seconds:
+            stale.append(item)
+
+    newest_age = None
+    if newest:
+        newest_age = max(0, int((now - newest).total_seconds()))
+
+    if not active:
+        state = "no_active_accounts"
+    elif newest is None:
+        state = "engine_not_seen"
+    elif newest_age is not None and newest_age > stale_after_seconds:
+        state = "engine_stale"
+    elif stale:
+        state = "partial_stale"
+    else:
+        state = "live"
+
+    return {
+        "health": "ok" if state in {"live", "partial_stale"} else "warning",
+        "service": "monitoring",
+        "release": NAIRAPIPS_MONITORING_RELEASE,
+        "monitoring_state": state,
+        "server_time": now_iso(),
+        "active_accounts": len(active),
+        "stale_accounts": len(stale),
+        "never_synced_accounts": len(never),
+        "newest_snapshot_at": newest.isoformat() if newest else None,
+        "newest_snapshot_age_seconds": newest_age,
+        "stale_after_seconds": stale_after_seconds,
+        "stale_sample": stale[:20],
+        "never_synced_sample": never[:20],
+    }
+
 @app.route("/health")
 def health():
-    return ok({"health": "ok", "service": "monitoring", "time": now_iso()})
+    try:
+        return ok(_monitoring_freshness_payload())
+    except Exception as e:
+        return bad({"health": "warning", "service": "monitoring", "error": str(e), "time": now_iso()}, 500)
+
+@app.route("/monitoring_health")
+def monitoring_health():
+    """Management diagnostic endpoint.
+
+    This does not invent MT5 data. It tells management whether fresh snapshots
+    are actually reaching the Monitoring API and which active accounts are stale.
+    """
+    try:
+        seconds = request.args.get("stale_after_seconds", "180")
+        try:
+            seconds = max(60, min(int(seconds), 86400))
+        except Exception:
+            seconds = 180
+        return ok(_monitoring_freshness_payload(seconds))
+    except Exception as e:
+        return bad(e, 500)
 
 
 @app.route("/monitorable_accounts")
