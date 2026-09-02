@@ -15,6 +15,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MAIN_API_URL = os.getenv("NAIRAPIPS_MAIN_API_URL", "https://nairapips-api.onrender.com").rstrip("/")
 MAX_DD_PERCENT = float(os.getenv("NAIRAPIPS_MAX_DD_PERCENT", "20"))
 MONITORABLE_LIMIT = int(os.getenv("NAIRAPIPS_MONITORABLE_LIMIT", "1000"))
+TERMINAL_RETIRE_AFTER_DAYS = int(os.getenv("NAIRAPIPS_TERMINAL_RETIRE_AFTER_DAYS", "30"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
@@ -881,6 +882,8 @@ def _parse_iso_ts(v):
 
 def _monitoring_freshness_payload(stale_after_seconds=180):
     now = datetime.now(timezone.utc)
+    # Best-effort maintenance: old terminal rows stay in history but leave live monitoring.
+    retire_old_terminal_accounts()
     rows = (
         supabase.table("trader_accounts")
         .select("id,trader_id,mt5_login,stage,account_status,last_sync_at,updated_at,current_balance,current_equity")
@@ -1123,6 +1126,74 @@ def _fast_rule_values(account, purchase=None, plan=None):
         "target_authority_source": target_source,
     }
 
+
+TERMINAL_RETIRE_STATUSES = {
+    "archived", "archived_phase1", "archived_phase2", "archived_funded",
+    "archived_reset", "archived_reset_phase1", "archived_reset_phase2", "archived_reset_funded",
+    "breached", "breached_archived", "passed", "closed", "disabled", "locked",
+    "disqualified"
+}
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def _terminal_retirement_reference_time(account):
+    for key in ("archived_at", "breached_at", "passed_at", "reset_at", "updated_at", "created_at", "started_at"):
+        dt = _parse_iso_dt((account or {}).get(key))
+        if dt is not None:
+            return dt
+    return None
+
+def _should_retire_terminal_account(account, now=None):
+    from datetime import datetime, timezone, timedelta
+    now = now or datetime.now(timezone.utc)
+    status = str((account or {}).get("account_status") or (account or {}).get("status") or "").strip().lower()
+    is_terminal = status in TERMINAL_RETIRE_STATUSES or status.startswith("archived_reset")
+    if not is_terminal:
+        return False, "not_terminal"
+    ref = _terminal_retirement_reference_time(account)
+    if ref is None:
+        return False, "missing_terminal_timestamp"
+    if ref > now - timedelta(days=max(1, TERMINAL_RETIRE_AFTER_DAYS)):
+        return False, "within_retention_window"
+    return True, f"terminal_{TERMINAL_RETIRE_AFTER_DAYS}d_plus"
+
+def retire_old_terminal_accounts():
+    """Best-effort retirement: keep history, stop MT5 monitoring. No deletes."""
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("id,account_status,status,monitoring_enabled,archived_at,breached_at,passed_at,reset_at,updated_at,created_at,started_at")
+            .limit(MONITORABLE_LIMIT)
+            .execute().data or []
+        )
+        retired = 0
+        for row in rows:
+            should, reason = _should_retire_terminal_account(row)
+            if not should:
+                continue
+            if bool_false(row.get("monitoring_enabled")):
+                continue
+            safe_update("trader_accounts", {
+                "monitoring_enabled": False,
+                "updated_at": now_iso(),
+            }, "id", row.get("id"))
+            retired += 1
+        if retired:
+            print(f"TERMINAL RETIREMENT: retired {retired} old terminal account(s) from MT5 monitoring", flush=True)
+        return retired
+    except Exception as e:
+        print("TERMINAL RETIREMENT ERROR:", e, flush=True)
+        return 0
 
 def _fast_monitorable_feed():
     """Production-critical MT5 discovery path.
