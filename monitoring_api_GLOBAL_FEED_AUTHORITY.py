@@ -341,18 +341,155 @@ def _rule_cache_set(key, value):
     _RULE_CACHE[key] = (time.time(), value)
     return value
 
+def _rule_first_positive_with_source(candidates):
+    """Return (value, source) from explicit commercial rule fields only."""
+    for source, value in candidates:
+        if value in (None, ""):
+            continue
+        n = num(value, None)
+        if n is not None and n > 0:
+            return float(n), str(source)
+    return None, ""
+
+
+def _rule_candidates(stage, account=None, purchase=None, plan=None, pool=None):
+    account = account or {}
+    purchase = purchase or {}
+    plan = plan or {}
+    pool = pool or {}
+    stage = str(stage or account.get("stage") or account.get("phase") or "phase1").strip().lower()
+
+    # Commercial authority: purchase snapshot first, then linked plan, then frozen account,
+    # then explicit MT5-pool metadata for manual/promo accounts. Never infer from account size.
+    dd = [
+        ("purchase.dd_limit_percent", purchase.get("dd_limit_percent")),
+        ("purchase.max_drawdown", purchase.get("max_drawdown")),
+        ("purchase.max_drawdown_percent", purchase.get("max_drawdown_percent")),
+        ("purchase.total_dd", purchase.get("total_dd")),
+        ("plan.dd_limit_percent", plan.get("dd_limit_percent")),
+        ("plan.max_drawdown", plan.get("max_drawdown")),
+        ("plan.max_drawdown_percent", plan.get("max_drawdown_percent")),
+        ("plan.total_dd", plan.get("total_dd")),
+        ("account.dd_limit_percent", account.get("dd_limit_percent")),
+        ("account.max_drawdown", account.get("max_drawdown")),
+        ("account.max_drawdown_percent", account.get("max_drawdown_percent")),
+        ("account.static_dd_limit_percent", account.get("static_dd_limit_percent")),
+        ("pool.dd_limit_percent", pool.get("dd_limit_percent")),
+        ("pool.max_drawdown", pool.get("max_drawdown")),
+        ("pool.max_drawdown_percent", pool.get("max_drawdown_percent")),
+    ]
+
+    common_target = [
+        ("purchase.target_percent", purchase.get("target_percent")),
+        ("purchase.profit_target", purchase.get("profit_target")),
+        ("purchase.profit_target_percent", purchase.get("profit_target_percent")),
+        ("plan.target_percent", plan.get("target_percent")),
+        ("plan.profit_target", plan.get("profit_target")),
+        ("plan.profit_target_percent", plan.get("profit_target_percent")),
+        ("account.target_percent", account.get("target_percent")),
+        ("account.profit_target", account.get("profit_target")),
+        ("account.profit_target_percent", account.get("profit_target_percent")),
+        ("account.phase_target_percent", account.get("phase_target_percent")),
+        ("pool.target_percent", pool.get("target_percent")),
+        ("pool.profit_target", pool.get("profit_target")),
+    ]
+    if stage == "phase1":
+        target = [
+            ("purchase.phase1_target", purchase.get("phase1_target")),
+            ("plan.phase1_target", plan.get("phase1_target")),
+            ("account.phase1_target", account.get("phase1_target")),
+            ("pool.phase1_target", pool.get("phase1_target")),
+        ] + common_target
+    elif stage == "phase2":
+        target = [
+            ("purchase.phase2_target", purchase.get("phase2_target")),
+            ("plan.phase2_target", plan.get("phase2_target")),
+            ("account.phase2_target", account.get("phase2_target")),
+            ("pool.phase2_target", pool.get("phase2_target")),
+        ] + common_target
+    else:
+        target = []
+    return dd, target
+
+
+def _norm_rule_text(v):
+    return re.sub(r"[^a-z0-9]+", " ", str(v or "").strip().lower()).strip()
+
+
+def _purchase_not_terminal(p):
+    blob = lifecycle_blob(p or {}, ["status", "payment_status", "lifecycle_state", "stage", "phase", "admin_note"])
+    return not any(word in blob for word in PURCHASE_BLOCK_WORDS)
+
+
+def _recover_purchase_for_account(account, all_purchases):
+    """Recover only by exact, unambiguous evidence; never by trader alone."""
+    account = account or {}
+    aid = str(account.get("id") or "").strip()
+    login = clean_login(account.get("mt5_login"))
+    tid = str(account.get("trader_id") or "").strip()
+    candidates = []
+    for p in all_purchases or []:
+        if not _purchase_not_terminal(p):
+            continue
+        ptid = str(p.get("trader_id") or "").strip()
+        if tid and ptid and ptid != tid:
+            continue
+        paid = str(p.get("trader_account_id") or "").strip()
+        plogin = clean_login(p.get("mt5_login"))
+        if aid and paid and paid == aid:
+            candidates.append((3, p))
+        elif login and plogin and plogin == login:
+            candidates.append((2, p))
+    if not candidates:
+        return {}
+    best = max(score for score, _ in candidates)
+    rows = [p for score, p in candidates if score == best]
+    unique_ids = {str(p.get("id") or "") for p in rows if p.get("id")}
+    return rows[0] if len(unique_ids) == 1 else {}
+
+
+def _recover_plan_for_purchase(account, purchase, plan_by_id, unique_plan_name_map):
+    account = account or {}; purchase = purchase or {}
+    pid = str(account.get("plan_id") or purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
+    if pid and pid in plan_by_id:
+        return plan_by_id[pid]
+    pname = _norm_rule_text(account.get("plan_name") or purchase.get("plan_name") or purchase.get("challenge_name"))
+    return unique_plan_name_map.get(pname) or {} if pname else {}
+
+
+def _freeze_rule_authority(account, purchase, plan, pool, rules):
+    """Persist recovered rules once so future scans are fast and auditable."""
+    if not account or not account.get("id"):
+        return
+    patch = {}
+    if rules.get("target_authority_present") and num(account.get("target_percent"), 0) <= 0:
+        patch["target_percent"] = rules.get("target_percent")
+    if rules.get("dd_authority_present") and num(account.get("dd_limit_percent"), 0) <= 0:
+        patch["dd_limit_percent"] = rules.get("dd_limit_percent")
+    if not account.get("purchase_id") and (purchase or {}).get("id"):
+        patch["purchase_id"] = purchase.get("id")
+    if not patch:
+        return
+    patch["updated_at"] = now_iso()
+    updated = safe_update("trader_accounts", patch, "id", account.get("id"))
+    if updated:
+        safe_insert("monitoring_events", {
+            "trader_id": account.get("trader_id"),
+            "trader_account_id": account.get("id"),
+            "mt5_login": clean_login(account.get("mt5_login")),
+            "event_type": "rule_authority_repaired",
+            "risk_zone": "audit",
+            "message": (
+                f"Exact rules frozen: target={rules.get('target_percent')} from {rules.get('target_authority_source')}; "
+                f"DD={rules.get('dd_limit_percent')} from {rules.get('dd_authority_source')}; "
+                f"purchase={(purchase or {}).get('id')}; plan={(plan or {}).get('id')}"
+            ),
+            "created_at": now_iso(),
+        })
+
+
 def resolve_account_rules(account, stage=None):
-    """Resolve exact commercial rules for THIS trader_account.
-
-    Authority order:
-      1) frozen trader_accounts values,
-      2) linked challenge purchase,
-      3) linked challenge plan.
-
-    NairaPips has multiple commercial rule sets (including 10% and 15%
-    targets and plan-specific DD). Missing authority must never be converted
-    into a guessed pass/breach rule.
-    """
+    """Resolve exact commercial rules for THIS trader_account; never guess 10/15 or DD."""
     account = account or {}
     stage = str(stage or account.get("stage") or "phase1").strip().lower()
     cache_key = "rules:" + str(account.get("id") or account.get("mt5_login") or "")
@@ -362,93 +499,39 @@ def resolve_account_rules(account, stage=None):
 
     purchase = {}
     plan = {}
+    pool = fetch_pool_by_id(account.get("mt5_pool_id")) if account.get("mt5_pool_id") else {}
     purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
     if purchase_id:
         purchase = fetch_purchase_by_id(purchase_id) or {}
-
-    plan_id = str(
-        account.get("plan_id")
-        or purchase.get("plan_id")
-        or purchase.get("challenge_plan_id")
-        or ""
-    ).strip()
+    plan_id = str(account.get("plan_id") or purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
     if plan_id:
         plan = fetch_plan_by_id(plan_id) or {}
 
-    def first_num(*values):
-        for v in values:
-            if v not in (None, ""):
-                n = num(v, None)
-                if n is not None and n > 0:
-                    return float(n)
-        return None
-
-    dd_limit = first_num(
-        account.get("dd_limit_percent"),
-        account.get("max_drawdown"),
-        account.get("max_drawdown_percent"),
-        purchase.get("dd_limit_percent"),
-        purchase.get("max_drawdown"),
-        purchase.get("max_drawdown_percent"),
-        plan.get("dd_limit_percent"),
-        plan.get("max_drawdown"),
-        plan.get("max_drawdown_percent"),
-        plan.get("total_dd"),
-    )
-    dd_authority_present = dd_limit is not None
-
-    if stage == "phase1":
-        target = first_num(
-            account.get("target_percent"),
-            account.get("profit_target"),
-            account.get("phase1_target"),
-            purchase.get("target_percent"),
-            purchase.get("phase1_target"),
-            purchase.get("profit_target"),
-            plan.get("target_percent"),
-            plan.get("phase1_target"),
-            plan.get("profit_target"),
-        )
-    elif stage == "phase2":
-        target = first_num(
-            account.get("target_percent"),
-            account.get("profit_target"),
-            account.get("phase2_target"),
-            purchase.get("target_percent"),
-            purchase.get("phase2_target"),
-            purchase.get("profit_target"),
-            plan.get("target_percent"),
-            plan.get("phase2_target"),
-            plan.get("profit_target"),
-        )
+    dd_candidates, target_candidates = _rule_candidates(stage, account, purchase, plan, pool)
+    dd_limit, dd_source = _rule_first_positive_with_source(dd_candidates)
+    if stage in {"phase1", "phase2"}:
+        target, target_source = _rule_first_positive_with_source(target_candidates)
     else:
-        target = 0.0
-
-    target_authority_present = (stage not in {"phase1", "phase2"}) or (target is not None)
+        target, target_source = 0.0, "funded"
 
     second_life_enabled = bool_true(
-        purchase.get("second_life_enabled")
-        if purchase.get("second_life_enabled") is not None
-        else plan.get("second_life_enabled")
+        purchase.get("second_life_enabled") if purchase.get("second_life_enabled") is not None else plan.get("second_life_enabled")
     )
-
     one_phase = second_life_enabled
     journey_text = " ".join(str(x or "") for x in (
-        account.get("challenge_journey"),
-        purchase.get("challenge_journey"),
-        purchase.get("journey_stages"),
-        purchase.get("route"),
-        plan.get("challenge_journey"),
-        plan.get("journey_stages"),
+        account.get("challenge_journey"), purchase.get("challenge_journey"), purchase.get("journey_stages"),
+        purchase.get("route"), plan.get("challenge_journey"), plan.get("journey_stages"),
     )).lower()
     if "one_phase" in journey_text or "1-phase" in journey_text or "1 phase" in journey_text:
         one_phase = True
 
     rules = {
         "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
-        "dd_authority_present": bool(dd_authority_present),
+        "dd_authority_present": bool(dd_limit is not None),
+        "dd_authority_source": dd_source,
         "target_percent": float(target) if target is not None else 0.0,
-        "target_authority_present": bool(target_authority_present),
+        "target_authority_present": bool(stage not in {"phase1", "phase2"} or target is not None),
+        "target_authority_source": target_source,
         "second_life_enabled": bool(second_life_enabled),
         "one_phase": bool(one_phase),
         "purchase_id": purchase_id or None,
@@ -701,7 +784,7 @@ def apply_intelligence(account, snapshot):
     target_equity = round(start * (1 + target / 100), 2) if target else 0.0
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
-    target_hit = bool(target_authority_present and target and highest >= target_equity and profit_percent >= target)
+    target_hit = bool(target_authority_present and target and highest >= target_equity)
 
     # TERMINAL EVENT AUTHORITY:
     # A real static DD breach must never be erased because the account also touched
@@ -824,7 +907,7 @@ def apply_intelligence(account, snapshot):
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
         "message": snapshot.get("reason") or "Monitoring snapshot applied",
-        "intelligence_version": "NIC_SPRINT1",
+        "intelligence_version": "REAL_USER_INSTANT_TARGET_DD_LEDGER_2026_09_02",
         "intelligence_event_id": f"{account.get('id')}:{snapshot.get('timestamp') or now_iso()}",
         "starting_balance": start,
         "current_balance": current_balance,
@@ -1030,92 +1113,33 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
     return True, "eligible"
 
 
-def _fast_rule_values(account, purchase=None, plan=None):
-    """Resolve exact monitoring rules without guessed commercial fallbacks."""
-    account = account or {}
-    purchase = purchase or {}
-    plan = plan or {}
+def _fast_rule_values(account, purchase=None, plan=None, pool=None):
+    """Resolve exact monitoring rules from explicit account/purchase/plan/pool evidence."""
+    account = account or {}; purchase = purchase or {}; plan = plan or {}; pool = pool or {}
     stage = str(account.get("stage") or account.get("phase") or "phase1").strip().lower()
-
-    def first_num(*values):
-        for v in values:
-            if v not in (None, ""):
-                n = num(v, None)
-                if n is not None and n > 0:
-                    return float(n)
-        return None
-
-    dd_limit = first_num(
-        account.get("dd_limit_percent"),
-        account.get("max_drawdown"),
-        account.get("max_drawdown_percent"),
-        purchase.get("dd_limit_percent"),
-        purchase.get("max_drawdown"),
-        purchase.get("max_drawdown_percent"),
-        plan.get("dd_limit_percent"),
-        plan.get("max_drawdown"),
-        plan.get("max_drawdown_percent"),
-        plan.get("total_dd"),
-    )
-
-    if stage == "phase1":
-        target = first_num(
-            account.get("target_percent"),
-            account.get("profit_target"),
-            account.get("phase1_target"),
-            purchase.get("target_percent"),
-            purchase.get("phase1_target"),
-            purchase.get("profit_target"),
-            plan.get("target_percent"),
-            plan.get("phase1_target"),
-            plan.get("profit_target"),
-        )
-    elif stage == "phase2":
-        target = first_num(
-            account.get("target_percent"),
-            account.get("profit_target"),
-            account.get("phase2_target"),
-            purchase.get("target_percent"),
-            purchase.get("phase2_target"),
-            purchase.get("profit_target"),
-            plan.get("target_percent"),
-            plan.get("phase2_target"),
-            plan.get("profit_target"),
-        )
+    dd_candidates, target_candidates = _rule_candidates(stage, account, purchase, plan, pool)
+    dd_limit, dd_source = _rule_first_positive_with_source(dd_candidates)
+    if stage in {"phase1", "phase2"}:
+        target, target_source = _rule_first_positive_with_source(target_candidates)
     else:
-        target = 0.0
-
+        target, target_source = 0.0, "funded"
     return {
         "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
         "dd_authority_present": bool(dd_limit is not None),
+        "dd_authority_source": dd_source,
         "target_percent": float(target) if target is not None else 0.0,
         "target_authority_present": bool(stage not in {"phase1", "phase2"} or target is not None),
+        "target_authority_source": target_source,
     }
 
 
 def _fast_monitorable_feed():
-    """Production-critical MT5 discovery path.
-
-    Maximum normal DB work:
-      1 trader_accounts query
-      1 challenge_purchases bulk query
-      1 mt5_pool bulk query
-      1 traders bulk query
-      1 challenge_plans bulk query
-
-    No per-account queries. No monitoring_events writes. No lifecycle reconciliation.
-    """
+    """Fast account feed with exact rule recovery + one-time frozen authority repair."""
     rows = (
-        supabase.table("trader_accounts")
-        .select("*")
+        supabase.table("trader_accounts").select("*")
         .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
-        .limit(MONITORABLE_LIMIT)
-        .execute()
-        .data
-        or []
+        .limit(MONITORABLE_LIMIT).execute().data or []
     )
-
-    # Cheapest account-level safety first.
     base = []
     for a in rows:
         if not is_active_monitoring_account(a):
@@ -1128,25 +1152,46 @@ def _fast_monitorable_feed():
             continue
         base.append(a)
 
+    # Linked rows first.
     purchase_map = _bulk_rows("challenge_purchases", [a.get("purchase_id") for a in base])
     pool_map = _bulk_rows("mt5_pool", [a.get("mt5_pool_id") for a in base])
 
+    # Recovery evidence: one bounded read each. Used ONLY for exact account-id/login matching.
+    try:
+        all_purchases = supabase.table("challenge_purchases").select("*").limit(max(MONITORABLE_LIMIT * 4, 1000)).execute().data or []
+    except Exception as e:
+        print("RULE AUTHORITY PURCHASE RECOVERY READ FAILED:", e, flush=True)
+        all_purchases = list(purchase_map.values())
+    try:
+        all_plans = supabase.table("challenge_plans").select("*").limit(1000).execute().data or []
+    except Exception as e:
+        print("RULE AUTHORITY PLAN RECOVERY READ FAILED:", e, flush=True)
+        all_plans = []
+    plan_by_id = {str(p.get("id")): p for p in all_plans if p.get("id")}
+    plan_names = {}
+    for p in all_plans:
+        key = _norm_rule_text(p.get("name") or p.get("plan_name"))
+        if key:
+            plan_names.setdefault(key, []).append(p)
+    unique_plan_name_map = {k: v[0] for k, v in plan_names.items() if len({str(x.get("id")) for x in v if x.get("id")}) == 1}
+
     eligible = []
     excluded = []
+    resolved_purchase = {}
     for a in base:
-        purchase = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        linked = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        recovered = linked or _recover_purchase_for_account(a, all_purchases)
         pool = pool_map.get(str(a.get("mt5_pool_id") or "")) or {}
-        ok, reason = _quiet_monitoring_eligibility(a, purchase, pool)
+        # Eligibility checks linked purchase only when the account explicitly stores purchase_id.
+        ok, reason = _quiet_monitoring_eligibility(a, linked, pool)
         if ok:
-            eligible.append(a)
+            eligible.append(a); resolved_purchase[str(a.get("id"))] = recovered
         else:
             excluded.append((a, reason))
 
-    # Exact-login ambiguity remains a hard safety exclusion, but logging is console-only.
     by_login = {}
     for a in eligible:
         by_login.setdefault(clean_login(a.get("mt5_login")), []).append(a)
-
     clean = []
     ambiguous = 0
     for login, group in by_login.items():
@@ -1154,84 +1199,60 @@ def _fast_monitorable_feed():
             clean.append(group[0])
         else:
             ambiguous += len(group)
-            print(
-                "FAST DISCOVERY EXCLUDED AMBIGUOUS LOGIN:",
-                {"mt5_login": login, "account_ids": [r.get("id") for r in group]},
-                flush=True,
-            )
+            print("FAST DISCOVERY EXCLUDED AMBIGUOUS LOGIN:", {"mt5_login": login, "account_ids": [r.get("id") for r in group]}, flush=True)
 
     trader_map = _bulk_rows("traders", [a.get("trader_id") for a in clean])
-
-    # Plan lookup is also bulk and only used as fallback when account/purchase does not
-    # already carry frozen commercial rules.
-    plan_ids = []
-    for a in clean:
-        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
-        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
-        if plan_id:
-            plan_ids.append(plan_id)
-    plan_map = _bulk_rows("challenge_plans", plan_ids)
-
     out = []
+    unresolved = []
+    repaired = 0
     for a in clean:
         t = trader_map.get(str(a.get("trader_id") or "")) or {}
-        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
-        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
-        plan = plan_map.get(str(plan_id or "")) or {}
-        rule_values = _fast_rule_values(a, p, plan)
-        dd_limit = rule_values["dd_limit_percent"]
-        target = rule_values["target_percent"]
+        p = resolved_purchase.get(str(a.get("id"))) or {}
+        pool = pool_map.get(str(a.get("mt5_pool_id") or "")) or {}
+        plan = _recover_plan_for_purchase(a, p, plan_by_id, unique_plan_name_map)
+        rules = _fast_rule_values(a, p, plan, pool)
+        before_target = num(a.get("target_percent"), 0)
+        before_dd = num(a.get("dd_limit_percent"), 0)
+        _freeze_rule_authority(a, p, plan, pool, rules)
+        if (before_target <= 0 and rules.get("target_authority_present")) or (before_dd <= 0 and rules.get("dd_authority_present")):
+            repaired += 1
+        if str(a.get("stage") or "phase1").lower() in {"phase1", "phase2"} and (not rules.get("target_authority_present") or not rules.get("dd_authority_present")):
+            unresolved.append({
+                "trader_account_id": a.get("id"), "mt5_login": clean_login(a.get("mt5_login")),
+                "stage": a.get("stage"), "purchase_id": a.get("purchase_id"),
+                "target_ok": rules.get("target_authority_present"), "dd_ok": rules.get("dd_authority_present"),
+            })
 
         out.append({
-            "id": a.get("id"),
-            "trader_id": a.get("trader_id"),
-            "trader_account_id": a.get("id"),
-            "current_account_id": a.get("id"),
-            "name": t.get("name") or t.get("trader_name") or "Trader",
-            "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
-            "email": t.get("email") or a.get("email"),
-            "phone": t.get("phone") or "",
-            "phase": a.get("stage") or t.get("phase") or "phase1",
-            "stage": a.get("stage") or t.get("phase") or "phase1",
-            "status": "active",
-            "account_status": a.get("account_status") or "assigned_active",
-            "payment_status": "approved",
-            "monitoring_enabled": True,
-            "mt5_access_disabled": False,
-            "mt5_login": clean_login(a.get("mt5_login")),
-            "mt5_server": a.get("mt5_server") or "",
+            "id": a.get("id"), "trader_id": a.get("trader_id"), "trader_account_id": a.get("id"), "current_account_id": a.get("id"),
+            "name": t.get("name") or t.get("trader_name") or "Trader", "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
+            "email": t.get("email") or a.get("email"), "phone": t.get("phone") or "",
+            "phase": a.get("stage") or t.get("phase") or "phase1", "stage": a.get("stage") or t.get("phase") or "phase1",
+            "status": "active", "account_status": a.get("account_status") or "assigned_active", "payment_status": "approved",
+            "monitoring_enabled": True, "mt5_access_disabled": False,
+            "mt5_login": clean_login(a.get("mt5_login")), "mt5_server": a.get("mt5_server") or "",
             "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
             "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
             "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
             "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
             "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
             "account_size": num(a.get("account_size") or a.get("start_balance")),
-            "dd_limit_percent": dd_limit,
-            "dd_authority_present": rule_values["dd_authority_present"],
-            "target_percent": target,
-            "target_authority_present": rule_values["target_authority_present"],
+            "dd_limit_percent": rules["dd_limit_percent"], "dd_authority_present": rules["dd_authority_present"], "dd_authority_source": rules["dd_authority_source"],
+            "target_percent": rules["target_percent"], "target_authority_present": rules["target_authority_present"], "target_authority_source": rules["target_authority_source"],
+            "purchase_id": p.get("id") or a.get("purchase_id"), "plan_id": plan.get("id") or a.get("plan_id"),
             "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "current_equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
             "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
-            "profit_percent": num(a.get("profit_percent")),
-            "risk_zone": a.get("risk_zone") or "safe",
+            "profit_percent": num(a.get("profit_percent")), "risk_zone": a.get("risk_zone") or "safe",
             "_source_of_truth": "monitoring_api_fast_discovery",
         })
 
-    print(
-        "FAST DISCOVERY COMPLETE:",
-        {
-            "active_rows": len(rows),
-            "base_eligible": len(base),
-            "monitorable": len(out),
-            "excluded": len(excluded),
-            "ambiguous": ambiguous,
-        },
-        flush=True,
-    )
+    print("FAST DISCOVERY COMPLETE:", {"active_rows": len(rows), "base_eligible": len(base), "monitorable": len(out), "excluded": len(excluded), "ambiguous": ambiguous, "rule_repairs": repaired, "rule_unresolved": len(unresolved)}, flush=True)
+    if unresolved:
+        print("CRITICAL RULE AUTHORITY UNRESOLVED:", unresolved[:50], flush=True)
     return out
 
 
@@ -1243,6 +1264,27 @@ def monitorable_accounts():
         return ok(out, f"{len(out)} monitorable account(s)")
     except Exception as e:
         print("FAST DISCOVERY FATAL ERROR:", repr(e), flush=True)
+        return bad(e, 500)
+
+
+@app.route("/rule_authority_health")
+def rule_authority_health():
+    """Operational proof that every active challenge has exact target + DD authority."""
+    try:
+        feed = _fast_monitorable_feed()
+        unresolved = []
+        for r in feed:
+            if str(r.get("stage") or "").lower() not in {"phase1", "phase2"}:
+                continue
+            if not r.get("target_authority_present") or not r.get("dd_authority_present"):
+                unresolved.append({
+                    "trader_account_id": r.get("trader_account_id"), "mt5_login": r.get("mt5_login"), "stage": r.get("stage"),
+                    "target_authority_present": r.get("target_authority_present"), "target_percent": r.get("target_percent"),
+                    "dd_authority_present": r.get("dd_authority_present"), "dd_limit_percent": r.get("dd_limit_percent"),
+                    "purchase_id": r.get("purchase_id"), "plan_id": r.get("plan_id"),
+                })
+        return ok({"healthy": len(unresolved) == 0, "monitorable": len(feed), "unresolved_count": len(unresolved), "unresolved": unresolved[:100], "release": NAIRAPIPS_MONITORING_RELEASE})
+    except Exception as e:
         return bad(e, 500)
 
 
