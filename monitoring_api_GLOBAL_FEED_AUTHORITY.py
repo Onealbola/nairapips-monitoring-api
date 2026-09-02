@@ -8,7 +8,7 @@ import os, re
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "FAST_DISCOVERY_SNAPSHOT_TIME_IMPORT_FIX_2026_09_01"
+NAIRAPIPS_MONITORING_RELEASE = "EXACT_PLAN_RULE_AUTHORITY_10_15_TARGET_DD_2026_09_02"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -344,14 +344,14 @@ def _rule_cache_set(key, value):
 def resolve_account_rules(account, stage=None):
     """Resolve exact commercial rules for THIS trader_account.
 
-    Priority:
+    Authority order:
       1) frozen trader_accounts values,
       2) linked challenge purchase,
-      3) linked challenge plan,
-      4) legacy defaults.
+      3) linked challenge plan.
 
-    This keeps legacy accounts at their own stored/default rules while allowing
-    2-Lives/current plans to use 10% DD and their configured Phase 1 target.
+    NairaPips has multiple commercial rule sets (including 10% and 15%
+    targets and plan-specific DD). Missing authority must never be converted
+    into a guessed pass/breach rule.
     """
     account = account or {}
     stage = str(stage or account.get("stage") or "phase1").strip().lower()
@@ -383,36 +383,48 @@ def resolve_account_rules(account, stage=None):
                     return float(n)
         return None
 
-    # Drawdown is static from starting balance, but the percentage is plan/account specific.
     dd_limit = first_num(
         account.get("dd_limit_percent"),
         account.get("max_drawdown"),
-        purchase.get("max_drawdown"),
+        account.get("max_drawdown_percent"),
         purchase.get("dd_limit_percent"),
+        purchase.get("max_drawdown"),
+        purchase.get("max_drawdown_percent"),
+        plan.get("dd_limit_percent"),
         plan.get("max_drawdown"),
+        plan.get("max_drawdown_percent"),
         plan.get("total_dd"),
     )
-    if not dd_limit:
-        dd_limit = float(MAX_DD_PERCENT or 20)
+    dd_authority_present = dd_limit is not None
 
     if stage == "phase1":
         target = first_num(
             account.get("target_percent"),
             account.get("profit_target"),
+            account.get("phase1_target"),
+            purchase.get("target_percent"),
             purchase.get("phase1_target"),
             purchase.get("profit_target"),
+            plan.get("target_percent"),
             plan.get("phase1_target"),
             plan.get("profit_target"),
-        ) or 10.0
+        )
     elif stage == "phase2":
         target = first_num(
             account.get("target_percent"),
             account.get("profit_target"),
+            account.get("phase2_target"),
+            purchase.get("target_percent"),
             purchase.get("phase2_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
             plan.get("phase2_target"),
-        ) or 8.0
+            plan.get("profit_target"),
+        )
     else:
         target = 0.0
+
+    target_authority_present = (stage not in {"phase1", "phase2"}) or (target is not None)
 
     second_life_enabled = bool_true(
         purchase.get("second_life_enabled")
@@ -420,8 +432,6 @@ def resolve_account_rules(account, stage=None):
         else plan.get("second_life_enabled")
     )
 
-    # Current 2-Lives product is a one-phase challenge: a valid Phase 1 PASS goes Funded.
-    # Old/legacy plans keep the old Phase1 -> Phase2 progression.
     one_phase = second_life_enabled
     journey_text = " ".join(str(x or "") for x in (
         account.get("challenge_journey"),
@@ -435,8 +445,10 @@ def resolve_account_rules(account, stage=None):
         one_phase = True
 
     rules = {
-        "dd_limit_percent": float(dd_limit),
-        "target_percent": float(target),
+        "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "dd_authority_present": bool(dd_authority_present),
+        "target_percent": float(target) if target is not None else 0.0,
+        "target_authority_present": bool(target_authority_present),
         "second_life_enabled": bool(second_life_enabled),
         "one_phase": bool(one_phase),
         "purchase_id": purchase_id or None,
@@ -445,12 +457,9 @@ def resolve_account_rules(account, stage=None):
     }
     return _rule_cache_set(cache_key, rules)
 
+
 def target_for_stage(stage):
-    stage = str(stage or "").strip().lower()
-    if stage == "phase1":
-        return 10.0
-    if stage == "phase2":
-        return 8.0
+    # Compatibility only. Never use this as commercial rule authority.
     return 0.0
 
 
@@ -660,9 +669,11 @@ def apply_intelligence(account, snapshot):
     )
     stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
     rules = resolve_account_rules(account, stage)
-    target = num(rules.get("target_percent"), target_for_stage(stage))
-    dd_limit_percent = num(rules.get("dd_limit_percent"), MAX_DD_PERCENT or 20)
-    breach_level = round(start * (1 - dd_limit_percent / 100), 2) if start else 0.0
+    target = num(rules.get("target_percent"), 0.0)
+    target_authority_present = bool(rules.get("target_authority_present"))
+    dd_limit_percent = num(rules.get("dd_limit_percent"), 0.0)
+    dd_authority_present = bool(rules.get("dd_authority_present"))
+    breach_level = round(start * (1 - dd_limit_percent / 100), 2) if start and dd_authority_present and dd_limit_percent > 0 else 0.0
 
     old_high = num(account.get("highest_equity") or start)
     old_low = num(account.get("lowest_equity") or start)
@@ -674,11 +685,11 @@ def apply_intelligence(account, snapshot):
     lowest = round(min(low_candidates), 2) if low_candidates else equity
 
     current_dd = static_dd(start, equity)
-    current_dd_used = dd_used_from_static(current_dd, dd_limit_percent)
+    current_dd_used = dd_used_from_static(current_dd, dd_limit_percent) if dd_authority_present else 0.0
     worst_dd = static_dd(start, lowest)
-    worst_dd_used = dd_used_from_static(worst_dd, dd_limit_percent)
-    dd_remaining = round(max(dd_limit_percent - current_dd, 0), 2)
-    zone = risk_zone(current_dd, dd_limit_percent)
+    worst_dd_used = dd_used_from_static(worst_dd, dd_limit_percent) if dd_authority_present else 0.0
+    dd_remaining = round(max(dd_limit_percent - current_dd, 0), 2) if dd_authority_present else 0.0
+    zone = risk_zone(current_dd, dd_limit_percent) if dd_authority_present else "authority_missing"
 
     # Current payout/closed profit follows the actual MT5 balance.
     # highest_equity remains pass-target evidence only.
@@ -690,14 +701,14 @@ def apply_intelligence(account, snapshot):
     target_equity = round(start * (1 + target / 100), 2) if target else 0.0
     pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
 
-    target_hit = bool(target and highest >= target_equity and profit_percent >= target)
+    target_hit = bool(target_authority_present and target and highest >= target_equity and profit_percent >= target)
 
     # TERMINAL EVENT AUTHORITY:
     # A real static DD breach must never be erased because the account also touched
     # its profit target. Use the worst evidence seen while this account is still live.
-    breached_by_equity = bool(start and equity <= breach_level)
-    breached_by_balance = bool(start and current_balance <= breach_level)
-    breached_by_recorded_low = bool(start and lowest <= breach_level)
+    breached_by_equity = bool(dd_authority_present and start and equity <= breach_level)
+    breached_by_balance = bool(dd_authority_present and start and current_balance <= breach_level)
+    breached_by_recorded_low = bool(dd_authority_present and start and lowest <= breach_level)
     breached = bool(breached_by_equity or breached_by_balance or breached_by_recorded_low)
 
     status = str(account.get("account_status") or "assigned_active").lower()
@@ -738,6 +749,8 @@ def apply_intelligence(account, snapshot):
         "dd_remaining_percent": dd_remaining,
         "breach_equity_level": breach_level,
         "target_percent": target,
+        "target_authority_present": target_authority_present,
+        "dd_authority_present": dd_authority_present,
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
         "risk_zone": zone,
@@ -1018,10 +1031,7 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
 
 
 def _fast_rule_values(account, purchase=None, plan=None):
-    """Resolve monitoring rules from frozen account values first, then purchase/plan.
-
-    This is deliberately pure/read-only: no Supabase calls are allowed here.
-    """
+    """Resolve exact monitoring rules without guessed commercial fallbacks."""
     account = account or {}
     purchase = purchase or {}
     plan = plan or {}
@@ -1038,32 +1048,49 @@ def _fast_rule_values(account, purchase=None, plan=None):
     dd_limit = first_num(
         account.get("dd_limit_percent"),
         account.get("max_drawdown"),
+        account.get("max_drawdown_percent"),
         purchase.get("dd_limit_percent"),
         purchase.get("max_drawdown"),
+        purchase.get("max_drawdown_percent"),
+        plan.get("dd_limit_percent"),
         plan.get("max_drawdown"),
+        plan.get("max_drawdown_percent"),
         plan.get("total_dd"),
-    ) or float(MAX_DD_PERCENT or 20)
+    )
 
     if stage == "phase1":
         target = first_num(
             account.get("target_percent"),
             account.get("profit_target"),
+            account.get("phase1_target"),
+            purchase.get("target_percent"),
             purchase.get("phase1_target"),
             purchase.get("profit_target"),
+            plan.get("target_percent"),
             plan.get("phase1_target"),
             plan.get("profit_target"),
-        ) or 10.0
+        )
     elif stage == "phase2":
         target = first_num(
             account.get("target_percent"),
             account.get("profit_target"),
+            account.get("phase2_target"),
+            purchase.get("target_percent"),
             purchase.get("phase2_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
             plan.get("phase2_target"),
-        ) or 8.0
+            plan.get("profit_target"),
+        )
     else:
         target = 0.0
 
-    return float(dd_limit), float(target)
+    return {
+        "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "dd_authority_present": bool(dd_limit is not None),
+        "target_percent": float(target) if target is not None else 0.0,
+        "target_authority_present": bool(stage not in {"phase1", "phase2"} or target is not None),
+    }
 
 
 def _fast_monitorable_feed():
@@ -1151,7 +1178,9 @@ def _fast_monitorable_feed():
         p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
         plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
         plan = plan_map.get(str(plan_id or "")) or {}
-        dd_limit, target = _fast_rule_values(a, p, plan)
+        rule_values = _fast_rule_values(a, p, plan)
+        dd_limit = rule_values["dd_limit_percent"]
+        target = rule_values["target_percent"]
 
         out.append({
             "id": a.get("id"),
@@ -1178,7 +1207,9 @@ def _fast_monitorable_feed():
             "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
             "account_size": num(a.get("account_size") or a.get("start_balance")),
             "dd_limit_percent": dd_limit,
+            "dd_authority_present": rule_values["dd_authority_present"],
             "target_percent": target,
+            "target_authority_present": rule_values["target_authority_present"],
             "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
             "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
