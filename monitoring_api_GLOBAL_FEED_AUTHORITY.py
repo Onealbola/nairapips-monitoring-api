@@ -575,6 +575,59 @@ def safe_update(table, payload, col, val):
         return []
 
 
+# 2026-09-03 FORENSIC FIX — verified persistence for live MT5 snapshots/breaches.
+# Supabase rejects an entire UPDATE when even one optional column is absent.
+# The previous monitoring path swallowed that error and still returned HTTP 200,
+# which allowed the engine to log "account locked" while the production row
+# remained assigned_active with stale balance/equity.
+_NP_ACCOUNT_CORE_WRITE_FIELDS = {
+    "current_balance", "current_equity", "profit", "profit_percent",
+    "highest_equity", "lowest_equity", "absolute_drawdown_percent",
+    "drawdown_percent", "dd_used_percent", "risk_zone",
+    "monitoring_enabled", "phase_pass_status", "passed_at",
+    "breached_at", "breach_reason", "account_status", "updated_at"
+}
+
+def verified_account_update(account_id, payload):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return False, {}, "missing_account_id"
+    first_error = None
+    try:
+        supabase.table("trader_accounts").update(payload).eq("id", account_id).execute()
+    except Exception as e:
+        first_error = e
+        print("VERIFIED ACCOUNT FULL UPDATE FAILED; retrying core fields:", e, flush=True)
+        core = {k: v for k, v in (payload or {}).items() if k in _NP_ACCOUNT_CORE_WRITE_FIELDS}
+        if not core:
+            return False, {}, f"full_update_failed_no_core:{e}"
+        try:
+            supabase.table("trader_accounts").update(core).eq("id", account_id).execute()
+        except Exception as e2:
+            print("VERIFIED ACCOUNT CORE UPDATE FAILED:", e2, flush=True)
+            return False, {}, f"full={first_error}; core={e2}"
+    try:
+        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        if not rows:
+            return False, {}, "readback_missing"
+        return True, rows[0], "core_fallback" if first_error else "full"
+    except Exception as e:
+        print("VERIFIED ACCOUNT READBACK FAILED:", e, flush=True)
+        return False, {}, f"readback_failed:{e}"
+
+def verified_trader_update(trader_id, payload):
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return False
+    try:
+        supabase.table("traders").update(payload).eq("id", trader_id).execute()
+        rows = supabase.table("traders").select("id").eq("id", trader_id).limit(1).execute().data or []
+        return bool(rows)
+    except Exception as e:
+        print("VERIFIED TRADER UPDATE FAILED:", e, flush=True)
+        return False
+
+
 def alert_once(account, event_type, title, message, severity="info", snapshot=None):
     """Create admin action evidence without depending on the main API."""
     account_id = account.get("id") if account else None
@@ -776,7 +829,9 @@ def apply_intelligence(account, snapshot):
         elif target_hit:
             update["passed_at"] = now_iso()
 
-    safe_update("trader_accounts", update, "id", account.get("id"))
+    account_write_ok, persisted_account, account_write_mode = verified_account_update(account.get("id"), update)
+    if not account_write_ok:
+        print(f"CRITICAL SNAPSHOT ACCOUNT WRITE FAILED mt5={account.get('mt5_login')} account_id={account.get('id')}", flush=True)
 
     trader_update = {
         "equity": equity,
@@ -797,7 +852,7 @@ def apply_intelligence(account, snapshot):
             "phase_pass_status": phase_pass_status,
             "lifecycle_updated_at": now_iso(),
         })
-    safe_update("traders", trader_update, "id", account.get("trader_id"))
+    trader_write_ok = verified_trader_update(account.get("trader_id"), trader_update)
 
     event = {
         "trader_id": account.get("trader_id"),
@@ -858,7 +913,7 @@ def apply_intelligence(account, snapshot):
     elif current_dd >= dd_limit_percent * 0.50:
         alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}% of a {dd_limit_percent:g}% limit.", "warning", event)
 
-    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used}
+    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used, "account_write_ok": account_write_ok, "account_write_mode": account_write_mode, "trader_write_ok": trader_write_ok, "persisted_account_status": (persisted_account or {}).get("account_status"), "persisted_balance": (persisted_account or {}).get("current_balance"), "persisted_equity": (persisted_account or {}).get("current_equity")}
 
 
 @app.route("/")
@@ -1363,7 +1418,11 @@ def monitoring_snapshot():
         return bad("Active account not found or ownership evidence mismatched", 404)
     result = apply_intelligence(account, data)
     print(f"GLOBAL_FEED SNAPSHOT APPLIED mt5={data.get('mt5_login')} result={result}", flush=True)
-    return ok(result, "snapshot applied")
+    if not isinstance(result, dict) or not result.get("account_write_ok"):
+        return bad(f"Snapshot persistence failed for MT5 {data.get('mt5_login')}: {result}", 500)
+    if result.get("breached") and str(result.get("persisted_account_status") or "").lower() != "breached_archived":
+        return bad(f"Breach persistence verification failed for MT5 {data.get('mt5_login')}: status={result.get('persisted_account_status')}", 500)
+    return ok(result, "snapshot applied and verified")
 
 
 @app.route("/disable_mt5_access", methods=["POST", "OPTIONS"])
@@ -1387,11 +1446,36 @@ def disable_mt5_access():
         "archived_at": now_iso(),
         "updated_at": now_iso(),
     }
-    safe_update("trader_accounts", payload, "id", account.get("id"))
-    safe_update("traders", {"status": "breached" if "breach" in status else status, "challenge_state": status, "mt5_access_disabled": True, "monitoring_enabled": False, "updated_at": now_iso()}, "id", account.get("trader_id"))
-    safe_insert("monitoring_events", {"trader_id": account.get("trader_id"), "trader_account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "event_type": status, "risk_zone": status, "message": reason, "created_at": now_iso()})
+    # Redundant final-evidence persistence: if /monitoring_snapshot failed because an
+    # optional schema column rejected the full payload, the lock endpoint still saves
+    # the real broker numbers with the terminal state.
+    evidence_map = {
+        "current_balance": data.get("current_balance") if data.get("current_balance") not in (None, "") else data.get("mt5_balance"),
+        "current_equity": data.get("equity"),
+        "profit": data.get("profit"),
+        "profit_percent": data.get("profit_percent"),
+        "highest_equity": data.get("highest_equity"),
+        "lowest_equity": data.get("lowest_equity"),
+        "absolute_drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
+        "drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
+        "dd_used_percent": data.get("dd_used_percent"),
+        "phase_pass_status": "" if "breach" in status else data.get("phase_pass_status"),
+        "breached_at": now_iso() if "breach" in status else account.get("breached_at"),
+        "breach_reason": reason if "breach" in status else account.get("breach_reason"),
+    }
+    for k, v in evidence_map.items():
+        if v not in (None, ""):
+            payload[k] = v
+
+    account_write_ok, persisted, write_mode = verified_account_update(account.get("id"), payload)
+    trader_write_ok = verified_trader_update(account.get("trader_id"), {"status": "breached" if "breach" in status else status, "challenge_state": status, "mt5_access_disabled": True, "monitoring_enabled": False, "updated_at": now_iso()})
+    safe_insert("monitoring_events", {"trader_id": account.get("trader_id"), "trader_account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "event_type": status, "risk_zone": "breached" if "breach" in status else status, "message": reason, "balance": payload.get("current_balance"), "equity": payload.get("current_equity"), "drawdown_percent": payload.get("drawdown_percent"), "dd_used_percent": payload.get("dd_used_percent"), "created_at": now_iso()})
     alert_once(account, status, status.upper(), reason, "critical", data)
-    return ok({"account_id": account.get("id"), "status": status}, "access disabled")
+    expected_status = "breached_archived" if "breach" in status else status
+    persisted_status = str((persisted or {}).get("account_status") or "").lower()
+    if not account_write_ok or persisted_status != str(expected_status).lower():
+        return bad(f"MT5 lock persistence failed: account_write_ok={account_write_ok}, mode={write_mode}, persisted_status={persisted_status}, expected={expected_status}", 500)
+    return ok({"account_id": account.get("id"), "status": status, "persisted_account_status": persisted_status, "persisted_balance": (persisted or {}).get("current_balance"), "persisted_equity": (persisted or {}).get("current_equity"), "account_write_mode": write_mode, "trader_write_ok": trader_write_ok}, "access disabled and verified")
 
 
 @app.route("/sync_trades", methods=["POST", "OPTIONS"])
