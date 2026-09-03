@@ -71,6 +71,10 @@ def is_active_monitoring_account(row):
         return False
     if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
         return False
+    # A verified breach is an irreversible lifecycle event for this exact account row.
+    # Removing a reversible lock or seeing a later recovered balance must never resurrect it.
+    if (row or {}).get("breached_at"):
+        return False
     if (row or {}).get("archived_at") or (row or {}).get("reset_at"):
         return False
     if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"}:
@@ -806,7 +810,8 @@ def apply_intelligence(account, snapshot):
     breached_by_equity = bool(dd_authority_present and start and equity <= breach_level)
     breached_by_balance = bool(dd_authority_present and start and current_balance <= breach_level)
     breached_by_recorded_low = bool(dd_authority_present and start and lowest <= breach_level)
-    breached = bool(breached_by_equity or breached_by_balance or breached_by_recorded_low)
+    terminal_breach_recorded = bool(account.get("breached_at"))
+    breached = bool(terminal_breach_recorded or breached_by_equity or breached_by_balance or breached_by_recorded_low)
 
     status = str(account.get("account_status") or "assigned_active").lower()
     phase_pass_status = ""
