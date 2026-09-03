@@ -560,11 +560,27 @@ def get_account_by_id_or_login(account_id=None, mt5_login=None):
 
 
 def safe_insert(table, payload):
-    try:
-        return supabase.table(table).insert(payload).execute().data or []
-    except Exception as e:
-        print(f"SAFE INSERT FAILED {table}:", e)
-        return []
+    work = dict(payload or {})
+    removed = []
+    for _ in range(24):
+        try:
+            return supabase.table(table).insert(work).execute().data or []
+        except Exception as e:
+            # Evidence tables have evolved over time. Remove only a column that PostgREST
+            # explicitly reports as unavailable; never guess or drop core account data here.
+            import re
+            text = str(e or '')
+            m = re.search(r"Could not find the '([^']+)' column", text, flags=re.I)
+            missing = m.group(1) if m else None
+            if missing and missing in work:
+                removed.append(missing)
+                work.pop(missing, None)
+                print(f"ADAPTIVE INSERT {table}: removed unavailable column {missing}; retrying", flush=True)
+                continue
+            print(f"SAFE INSERT FAILED {table}:", e, flush=True)
+            return []
+    print(f"SAFE INSERT FAILED {table}: too many unavailable columns removed={removed}", flush=True)
+    return []
 
 
 def safe_update(table, payload, col, val):
@@ -575,45 +591,72 @@ def safe_update(table, payload, col, val):
         return []
 
 
-# 2026-09-03 FORENSIC FIX — verified persistence for live MT5 snapshots/breaches.
-# Supabase rejects an entire UPDATE when even one optional column is absent.
-# The previous monitoring path swallowed that error and still returned HTTP 200,
-# which allowed the engine to log "account locked" while the production row
-# remained assigned_active with stale balance/equity.
-_NP_ACCOUNT_CORE_WRITE_FIELDS = {
-    "current_balance", "current_equity", "profit", "profit_percent",
-    "highest_equity", "lowest_equity", "absolute_drawdown_percent",
-    "drawdown_percent", "dd_used_percent", "risk_zone",
-    "monitoring_enabled", "phase_pass_status", "passed_at",
-    "breached_at", "breach_reason", "account_status", "updated_at"
-}
+# 2026-09-03 FORENSIC FIX V2 — adaptive verified persistence for live MT5 snapshots/breaches.
+# IMPORTANT: the production database has compatibility triggers that validate derived DD fields.
+# A narrow "core only" retry can therefore still fail when it changes balance/equity without also
+# updating the matching derived field (for example worst_static_drawdown_percent).
+# Instead, retry the SAME coherent snapshot while removing only columns PostgREST explicitly says
+# do not exist. This preserves trigger-consistent values and prevents one new optional column from
+# blocking every account snapshot.
+
+def _np_missing_column_from_error(exc):
+    text = str(exc or '')
+    import re
+    patterns = [
+        r"Could not find the '([^']+)' column",
+        r'Could not find the "([^"]+)" column',
+        r"column ['\"]?([A-Za-z0-9_]+)['\"]? does not exist",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _np_adaptive_table_update(table, match_col, match_val, payload, max_missing_columns=32):
+    work = dict(payload or {})
+    removed = []
+    last_error = None
+    for _ in range(max_missing_columns + 1):
+        if not work:
+            return False, removed, last_error or 'empty_payload'
+        try:
+            supabase.table(table).update(work).eq(match_col, match_val).execute()
+            return True, removed, None
+        except Exception as e:
+            last_error = e
+            missing = _np_missing_column_from_error(e)
+            if missing and missing in work:
+                removed.append(missing)
+                work.pop(missing, None)
+                print(f"ADAPTIVE {table} UPDATE: removed unavailable column {missing}; retrying coherent snapshot", flush=True)
+                continue
+            return False, removed, e
+    return False, removed, last_error
+
 
 def verified_account_update(account_id, payload):
-    account_id = str(account_id or "").strip()
+    account_id = str(account_id or '').strip()
     if not account_id:
-        return False, {}, "missing_account_id"
-    first_error = None
+        return False, {}, 'missing_account_id'
+
+    ok, removed, err = _np_adaptive_table_update('trader_accounts', 'id', account_id, payload)
+    if not ok:
+        print('VERIFIED ACCOUNT ADAPTIVE UPDATE FAILED:', err, flush=True)
+        return False, {}, f'adaptive_update_failed:{err}'
+
     try:
-        supabase.table("trader_accounts").update(payload).eq("id", account_id).execute()
-    except Exception as e:
-        first_error = e
-        print("VERIFIED ACCOUNT FULL UPDATE FAILED; retrying core fields:", e, flush=True)
-        core = {k: v for k, v in (payload or {}).items() if k in _NP_ACCOUNT_CORE_WRITE_FIELDS}
-        if not core:
-            return False, {}, f"full_update_failed_no_core:{e}"
-        try:
-            supabase.table("trader_accounts").update(core).eq("id", account_id).execute()
-        except Exception as e2:
-            print("VERIFIED ACCOUNT CORE UPDATE FAILED:", e2, flush=True)
-            return False, {}, f"full={first_error}; core={e2}"
-    try:
-        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        rows = supabase.table('trader_accounts').select('*').eq('id', account_id).limit(1).execute().data or []
         if not rows:
-            return False, {}, "readback_missing"
-        return True, rows[0], "core_fallback" if first_error else "full"
+            return False, {}, 'readback_missing'
+        mode = 'adaptive_full' if removed else 'full'
+        if removed:
+            print(f"VERIFIED ACCOUNT UPDATE OK after removing unavailable columns: {removed}", flush=True)
+        return True, rows[0], mode
     except Exception as e:
-        print("VERIFIED ACCOUNT READBACK FAILED:", e, flush=True)
-        return False, {}, f"readback_failed:{e}"
+        print('VERIFIED ACCOUNT READBACK FAILED:', e, flush=True)
+        return False, {}, f'readback_failed:{e}'
 
 def verified_trader_update(trader_id, payload):
     trader_id = str(trader_id or "").strip()
