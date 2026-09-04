@@ -1,1671 +1,1866 @@
-
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
-from werkzeug.utils import secure_filename
 from datetime import datetime, timezone
-import os, random, uuid
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os, re, json
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+
 app = Flask(__name__)
+NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
+NAIRAPIPS_MONITORING_RELEASE = "EXACT_PLAN_RULE_AUTHORITY_10_15_TARGET_DD_2026_09_02"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SMTP_EMAIL = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASS")
+MAIN_API_URL = os.getenv("NAIRAPIPS_MAIN_API_URL", "https://nairapips-api.onrender.com").rstrip("/")
+MAX_DD_PERCENT = float(os.getenv("NAIRAPIPS_MAX_DD_PERCENT", "20"))
+MONITORABLE_LIMIT = int(os.getenv("NAIRAPIPS_MONITORABLE_LIMIT", "1000"))
+TERMINAL_RETIRE_AFTER_DAYS = int(os.getenv("NAIRAPIPS_TERMINAL_RETIRE_AFTER_DAYS", "30"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ================================
-# NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
-# ================================
 
-def _np_ok(data=None, status=200):
-    res = jsonify(data or {"success": True})
-    res.status_code = status
-    res.headers["Access-Control-Allow-Origin"] = "*"
-    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return res
-
-def _np_fail(message, status=400):
-    return _np_ok({"success": False, "error": str(message)}, status)
-
-def _dt_score(value):
-    try:
-        if not value:
-            return 0
-        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
-    except Exception:
-        return 0
-
-def _row_score(t):
-    status = str(t.get("status") or "").strip().lower()
-    pay = str(t.get("payment_status") or "").strip().lower()
-    score = 0
-
-    if pay == "approved":
-        score += 90_000_000_000
-    if status in ["active", "funded", "live"]:
-        score += 80_000_000_000
-    if str(t.get("mt5_login") or "").strip():
-        score += 70_000_000_000
-    if str(t.get("mt5_updated_at") or "").strip():
-        score += 60_000_000_000
-    if pay == "rejected" or status in ["rejected", "payment_rejected"]:
-        score -= 99_000_000_000
-    if status in ["no_account", "new_signup", "pending", "payment_pending"]:
-        score -= 50_000_000_000
-
-    for key in ["mt5_updated_at", "updated_at", "approved_at", "challenge_started_at", "assigned_at", "created_at", "last_login_at"]:
-        d = _dt_score(t.get(key))
-        if d:
-            score += d
-            break
-
-    return score
-
-def _dedupe_traders(rows):
-    groups = {}
-    for row in rows or []:
-        email = str(row.get("email") or "").strip().lower()
-        phone = str(row.get("phone") or "").strip().lower()
-        key = email or phone or str(row.get("id") or "")
-        groups.setdefault(key, []).append(row)
-
-    output = []
-    for key, items in groups.items():
-        items = sorted(items, key=_row_score, reverse=True)
-        output.append(items[0])
-
-    output.sort(key=_row_score, reverse=True)
-    return output
-
-def _latest_trader_for_lookup(lookup):
-    lookup = str(lookup or "").strip().lower()
-    if not lookup:
-        return None
-
-    res = supabase.table("traders").select("*").execute()
-    rows = getattr(res, "data", []) or []
-
-    matches = []
-    for t in rows:
-        keys = [
-            str(t.get("email") or "").strip().lower(),
-            str(t.get("phone") or "").strip().lower(),
-            str(t.get("mt5_login") or "").strip().lower(),
-            str(t.get("account_reference") or "").strip().lower(),
-            str(t.get("id") or "").strip().lower(),
-        ]
-        if lookup in keys:
-            matches.append(t)
-
-    if not matches:
-        return None
-
-    return sorted(matches, key=_row_score, reverse=True)[0]
-
-def _safe_update_table(table, payload, column, value):
-    try:
-        if value is None or str(value).strip() == "":
-            return None
-        return supabase.table(table).update(payload).eq(column, value).execute()
-    except Exception as e:
-        print(f"SAFE UPDATE FAILED {table}.{column}:", e)
-        return None
-
-@app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
-@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
-def update_trader_mt5():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-
-    data = request.get_json(silent=True) or {}
-    trader_id = data.get("id") or data.get("trader_id")
-    if not trader_id:
-        return _np_fail("Trader ID is required")
-
-    mt5_login = str(data.get("mt5_login") or "").strip()
-    mt5_server = str(data.get("mt5_server") or "").strip()
-    if not mt5_login:
-        return _np_fail("MT5 login is required")
-    if not mt5_server:
-        return _np_fail("MT5 server is required")
-
-    master_password = data.get("mt5_password") or data.get("master_password") or data.get("mt5_master_password") or ""
-    investor_password = data.get("mt5_investor_password") or data.get("investor_password") or ""
-    now = datetime.now(timezone.utc).isoformat()
-
-    trader_update = {
-        "mt5_login": mt5_login,
-        "mt5_server": mt5_server,
-        "mt5_master_password": master_password,
-        "mt5_investor_password": investor_password,
-        "mt5_password": master_password,
-        "master_password": master_password,
-        "investor_password": investor_password,
-        "phase": data.get("phase") or "phase1",
-        "status": data.get("status") or "active",
-        "payment_status": data.get("payment_status") or "approved",
-        "approved_at": data.get("approved_at") or now,
-        "challenge_started_at": data.get("challenge_started_at") or now,
-        "mt5_updated_at": now,
-        "updated_at": now,
-        "mt5_updated_by": data.get("mt5_updated_by") or "admin",
-        "mt5_reset_reason": data.get("mt5_reset_reason") or "MT5 login details updated",
-        "admin_note": data.get("admin_note") or "MT5 login details updated",
-    }
-
-    if not str(master_password).strip():
-        for k in ["mt5_master_password", "mt5_password", "master_password"]:
-            trader_update.pop(k, None)
-    if not str(investor_password).strip():
-        for k in ["mt5_investor_password", "investor_password"]:
-            trader_update.pop(k, None)
-
-    try:
-        result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute()
-        trader_rows = getattr(result, "data", []) or []
-        if not trader_rows:
-            fetched = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
-            trader_rows = getattr(fetched, "data", []) or []
-
-        trader_email = (trader_rows[0].get("email") if trader_rows else "") or data.get("email") or ""
-        trader_phone = (trader_rows[0].get("phone") if trader_rows else "") or data.get("phone") or ""
-
-        purchase_update = {
-            "mt5_login": mt5_login,
-            "mt5_server": mt5_server,
-            "mt5_master_password": master_password,
-            "mt5_investor_password": investor_password,
-            "mt5_password": master_password,
-            "master_password": master_password,
-            "investor_password": investor_password,
-            "payment_status": "approved",
-            "status": "approved",
-            "assigned_at": now,
-            "approved_at": now,
-            "updated_at": now,
-            "admin_note": data.get("admin_note") or "MT5 login details updated",
-        }
-
-        if not str(master_password).strip():
-            for k in ["mt5_master_password", "mt5_password", "master_password"]:
-                purchase_update.pop(k, None)
-        if not str(investor_password).strip():
-            for k in ["mt5_investor_password", "investor_password"]:
-                purchase_update.pop(k, None)
-
-        _safe_update_table("challenge_purchases", purchase_update, "trader_id", trader_id)
-        _safe_update_table("challenge_purchases", purchase_update, "email", trader_email)
-        _safe_update_table("challenge_purchases", purchase_update, "phone", trader_phone)
-
-        return _np_ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/trader_source", methods=["POST", "OPTIONS"])
-def trader_source():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    data = request.get_json(silent=True) or {}
-    lookup = data.get("lookup") or data.get("email") or data.get("phone") or data.get("id")
-    trader = _latest_trader_for_lookup(lookup)
-    if not trader:
-        return _np_fail("Trader not found", 404)
-    return _np_ok({"success": True, "data": trader, "trader": trader})
-
-@app.route("/trader_source/<path:lookup>", methods=["GET"])
-def trader_source_get(lookup):
-    trader = _latest_trader_for_lookup(lookup)
-    if not trader:
-        return _np_fail("Trader not found", 404)
-    return _np_ok({"success": True, "data": trader, "trader": trader})
-
-
-
-SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
-
-def send_email(to_email, subject, message):
-    try:
-        if not to_email:
-            return False
-
-        msg = MIMEMultipart()
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-        msg["Subject"] = subject
-
-        msg.attach(MIMEText(message, "plain"))
-
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        server.quit()
-
-        return True
-    except Exception as e:
-        print("EMAIL ERROR:", str(e))
-        return False
-def now_iso(): return datetime.now(timezone.utc).isoformat()
-def ref(): return "NP-" + str(random.randint(100000,999999))
-def clean(v):
-    return float(str(v or "0").replace(",","").replace("₦","").strip() or 0)
-def month(): return datetime.now(timezone.utc).strftime("%B")
-def year(): return datetime.now(timezone.utc).strftime("%Y")
-def ok(data=None, message="ok"): return jsonify({"success": True, "message": message, "data": data})
-def bad(e, code=400): return jsonify({"success": False, "error": str(e)}), code
-
-@app.route("/")
-def home():
-    return jsonify({"status":"NairaPips API Live","database":"connected","version":"proof-upload-upgrade"})
-
-@app.route("/health")
-def health():
-    return jsonify({"health":"ok"})
-
-@app.route("/upload_payment_proof", methods=["POST"])
-def upload_payment_proof():
-    try:
-        f = request.files.get("file")
-        if not f or not f.filename:
-            return bad("No file uploaded")
-        bucket = request.form.get("bucket","payment-proofs")
-        folder = request.form.get("folder","challenge-purchases")
-        name = secure_filename(f.filename)
-        ext = name.rsplit(".",1)[-1].lower() if "." in name else "bin"
-        if ext not in {"jpg","jpeg","png","webp","pdf"}:
-            return bad("Only JPG, PNG, WEBP and PDF proof files are allowed")
-        path = f"{folder}/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
-        supabase.storage.from_(bucket).upload(path, f.read(), {"content-type": f.content_type or "application/octet-stream", "upsert": "false"})
-        url = supabase.storage.from_(bucket).get_public_url(path)
-        return jsonify({"success": True, "url": url, "path": path})
-    except Exception as e:
-        print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e), "hint": "Create a PUBLIC Supabase Storage bucket named payment-proofs."}), 400
-
-@app.route("/traders_raw", methods=["GET"])
-def get_traders_raw():
-    try:
-        return jsonify(supabase.table("traders").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e:
-        return bad(e)
-
-@app.route("/traders", methods=["GET"])
-def get_traders():
-    try:
-        res = supabase.table("traders").select("*").execute()
-        rows = getattr(res, "data", []) or []
-        return jsonify(_dedupe_traders(rows))
-    except Exception as e:
-        return bad(e)
-
-@app.route("/traders", methods=["POST"])
-def add_trader():
-    try:
-        d = request.json or {}
-        bal = clean(d.get("balance") or d.get("account_size"))
-
-        row = {
-            "name": d.get("name", ""),
-            "phone": d.get("phone", ""),
-            "email": d.get("email", ""),
-            "mt5_login": d.get("mt5_login", ""),
-            "mt5_server": d.get("mt5_server", ""),
-            "mt5_master_password": d.get("mt5_master_password", ""),
-            "mt5_investor_password": d.get("mt5_investor_password", ""),
-            "account_size": bal,
-            "balance": bal,
-            "equity": bal,
-            "phase": d.get("phase", "no_account"),
-            "status": d.get("status", "payment_pending"),
-            "engine_group": d.get("engine_group", "engine_1"),
-            "profit": 0,
-            "drawdown": 0,
-            "profit_percent": 0,
-            "drawdown_percent": 0,
-            "payment_status": d.get("payment_status", "pending"),
-            "payment_proof_url": d.get("payment_proof_url", ""),
-            "selected_plan": d.get("selected_plan", ""),
-            "payment_note": d.get("payment_note", ""),
-            "approved_by": "",
-            "admin_note": "",
-            "account_reference": d.get("account_reference") or ref(),
-            "challenge_started_at": d.get("challenge_started_at"),
-            "approved_at": d.get("approved_at"),
-            "funded_at": d.get("funded_at"),
-            "last_login_at": None,
-            "trading_days_left": d.get("trading_days_left", 30)
-        }
-
-        return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
-
-    except Exception as e:
-        return bad(e)
-              
-@app.route("/delete_trader", methods=["POST"])
-def delete_trader():
-    try:
-        trader_id = (request.json or {}).get("id")
-
-        if not trader_id:
-            return bad("Missing trader id")
-
-        found = supabase.table("traders").select("*").eq("id", trader_id).execute().data
-        trader = found[0] if found else {}
-
-        email = trader.get("email")
-        phone = trader.get("phone")
-
-        related_tables = [
-            "challenge_purchases",
-            "payouts",
-            "support_tickets",
-            "monitoring_snapshots",
-            "monitoring_events"
-        ]
-
-        for table in related_tables:
-            try:
-                supabase.table(table).delete().eq("trader_id", trader_id).execute()
-            except Exception:
-                pass
-
-            if email:
-                try:
-                    supabase.table(table).delete().eq("email", email).execute()
-                except Exception:
-                    pass
-
-            if phone:
-                try:
-                    supabase.table(table).delete().eq("phone", phone).execute()
-                except Exception:
-                    pass
-
-        supabase.table("traders").delete().eq("id", trader_id).execute()
-
-        return ok([], "Trader and all related activity deleted")
-
-    except Exception as e:
-        return bad(e)
-@app.route("/login_trader", methods=["POST"])
-def login_trader():
-    try:
-        lookup = str((request.json or {}).get("lookup", "")).strip().lower()
-        if not lookup:
-            return bad("Missing lookup")
-        trader = _latest_trader_for_lookup(lookup)
-        if not trader:
-            return bad("Trader not found", 404)
-        t = now_iso()
-        supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
-        trader["last_login_at"] = t
-        return ok(trader, "Login successful")
-    except Exception as e:
-        return bad(e)
-
-@app.route("/approve_payment", methods=["POST"])
-def approve_payment():
-    try:
-        d=request.json or {}; tid=d.get("id")
-        if not tid: return bad("Missing trader id")
-        required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
-        if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 credentials are required")
-        upd={k:str(d.get(k,"")).strip() for k in required}
-        upd.update({"payment_status":"approved","status":"active","phase":d.get("phase","phase1"),"approved_at":now_iso(),
-                    "challenge_started_at":now_iso(),"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note","")})
-        if d.get("balance") or d.get("account_size"):
-            bal=clean(d.get("balance") or d.get("account_size")); upd.update({"account_size":bal,"balance":bal,"equity":bal})
-        return ok(supabase.table("traders").update(upd).eq("id",tid).execute().data, "Payment approved")
-    except Exception as e: return bad(e)
-
-@app.route("/reject_payment", methods=["POST"])
-def reject_payment():
-    try:
-        d=request.json or {}; tid=d.get("id")
-        if not tid: return bad("Missing trader id")
-        return ok(supabase.table("traders").update({"payment_status":"rejected","status":"payment_rejected","admin_note":d.get("admin_note","")}).eq("id",tid).execute().data, "Payment rejected")
-    except Exception as e: return bad(e)
-
-@app.route("/update_status", methods=["POST"])
-def update_status():
-    try:
-        d=request.json or {}; tid=d.get("id")
-        if not tid: return bad("Missing trader id")
-        allowed=["status","phase","balance","equity","profit","drawdown","profit_percent","drawdown_percent","engine_group","payment_status","payment_note","admin_note","trading_days_left"]
-        upd={k:d[k] for k in allowed if k in d}
-        if d.get("phase")=="funded" or d.get("status")=="funded": upd["funded_at"]=now_iso()
-        if not upd: return bad("Nothing to update")
-        return ok(supabase.table("traders").update(upd).eq("id",tid).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/activate_trader", methods=["POST"])
-def activate_trader():
-    try:
-        tid=(request.json or {}).get("id")
-        if not tid: return bad("Missing trader id")
-        return ok(supabase.table("traders").update({"status":"active"}).eq("id",tid).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/deactivate_trader", methods=["POST"])
-def deactivate_trader():
-    try:
-        tid=(request.json or {}).get("id")
-        if not tid: return bad("Missing trader id")
-        return ok(supabase.table("traders").update({"status":"inactive"}).eq("id",tid).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/challenge_plans", methods=["GET"])
-def challenge_plans():
-    try: return jsonify(supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_challenge_plan", methods=["POST"])
-def create_plan():
-    try:
-        d=request.json or {}; name=str(d.get("name","")).strip()
-        if not name: return bad("Plan name is required")
-        row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
-             "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
-             "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":d.get("daily_drawdown","None"),
-             "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),"status":"active","created_at":now_iso(),"updated_at":now_iso()}
-        return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
-    except Exception as e: return bad(e)
-
-@app.route("/update_challenge_plan", methods=["POST"])
-def update_plan():
-    try:
-        d=request.json or {}; pid=d.get("id")
-        if not pid: return bad("Missing plan id")
-        upd={"updated_at":now_iso()}
-        for k in ["name","daily_drawdown","payout_split","description","status"]:
-            if k in d: upd[k]=d[k]
-        for k in ["account_size","fee"]:
-            if k in d: upd[k]=clean(d[k])
-        for k in ["phase1_target","phase2_target","max_drawdown"]:
-            if k in d: upd[k]=float(d.get(k) or 0)
-        return ok(supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data, "Challenge plan updated")
-    except Exception as e: return bad(e)
-
-@app.route("/delete_challenge_plan", methods=["POST"])
-def delete_plan():
-    try:
-        pid=(request.json or {}).get("id")
-        if not pid: return bad("Missing plan id")
-        return ok(supabase.table("challenge_plans").delete().eq("id",pid).execute().data, "Challenge plan deleted")
-    except Exception as e: return bad(e)
-
-@app.route("/challenge_purchases", methods=["GET"])
-def challenge_purchases():
-    try: return jsonify(supabase.table("challenge_purchases").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_challenge_purchase", methods=["POST"])
-def create_purchase():
-    try:
-        d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url","")).strip()
-        if not plan: return bad("Plan name is required")
-        if not proof: return bad("Payment proof is required")
-        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
-             "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
-             "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
-        return ok(supabase.table("challenge_purchases").insert(row).execute().data, "Challenge purchase submitted")
-    except Exception as e: return bad(e)
-
-@app.route("/approve_challenge_purchase", methods=["POST"])
-def approve_purchase():
-    try:
-        d=request.json or {}; pid=d.get("id"); mt5_id=d.get("mt5_id")
-        if not pid: return bad("Missing purchase id")
-        pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
-        if not pres.data: return bad("Purchase not found",404)
-        p=pres.data[0]
-        if mt5_id:
-            mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
-        else:
-            mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
-        if not mres.data: return bad("No available MT5 account found for this plan/account size")
-        m=mres.data[0]; t=now_iso()
-        supabase.table("challenge_purchases").update({"payment_status":"approved","status":"approved_active","assigned_mt5_id":m.get("id"),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"approved_at":t,"assigned_at":t,
-            "admin_note":d.get("admin_note","Challenge approved and MT5 assigned")}).eq("id",pid).execute()
-        supabase.table("mt5_pool").update({"status":"assigned","assigned_trader_id":p.get("trader_id"),"assigned_trader_name":p.get("trader_name",""),
-            "assigned_email":p.get("email",""),"assigned_at":t,"updated_at":t,"admin_note":"Assigned through challenge purchase approval"}).eq("id",m.get("id")).execute()
-        lookup=supabase.table("traders").select("*").or_(f"email.eq.{p.get('email','')},phone.eq.{p.get('phone','')}").limit(1).execute()
-        td={"name":p.get("trader_name",""),"phone":p.get("phone",""),"email":p.get("email",""),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":m.get("mt5_master_password",""),
-            "mt5_password":m.get("mt5_master_password",""),"master_password":m.get("mt5_master_password",""),
-            "mt5_investor_password":m.get("mt5_investor_password",""),"investor_password":m.get("mt5_investor_password",""),
-            "mt5_updated_at":t,"updated_at":t,"account_size":p.get("account_size") or 0,
-            "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
-            "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
-            "approved_at":t,"challenge_started_at":t,"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note",""),"trading_days_left":30}
-        if lookup.data:
-            supabase.table("traders").update(td).eq("id",lookup.data[0]["id"]).execute()
-        else:
-            td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
-            supabase.table("traders").insert(td).execute()
-        return ok(supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data, "Challenge purchase approved and MT5 assigned")
-    except Exception as e: return bad(e)
-
-@app.route("/reject_challenge_purchase", methods=["POST"])
-def reject_purchase():
-    try:
-        d=request.json or {}; pid=d.get("id")
-        if not pid: return bad("Missing purchase id")
-        return ok(supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":d.get("admin_note","Challenge purchase rejected")}).eq("id",pid).execute().data, "Challenge purchase rejected")
-    except Exception as e: return bad(e)
-
-@app.route("/mt5_pool", methods=["GET"])
-def mt5_pool():
-    try: return jsonify(supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_mt5_account", methods=["POST"])
-def create_mt5():
-    try:
-        d=request.json or {}
-        required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
-        if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 details are required")
-        row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"mt5_login":str(d.get("mt5_login","")).strip(),
-             "mt5_server":str(d.get("mt5_server","")).strip(),"mt5_master_password":str(d.get("mt5_master_password","")).strip(),
-             "mt5_investor_password":str(d.get("mt5_investor_password","")).strip(),"status":d.get("status","available"),
-             "admin_note":d.get("admin_note",""),"created_at":now_iso(),"updated_at":now_iso()}
-        return ok(supabase.table("mt5_pool").insert(row).execute().data, "MT5 account added")
-    except Exception as e: return bad(e)
-
-@app.route("/update_mt5_account", methods=["POST"])
-def update_mt5():
-    try:
-        d=request.json or {}; mid=d.get("id")
-        if not mid: return bad("Missing MT5 account id")
-        upd={"updated_at":now_iso()}
-        for k in ["plan_name","mt5_login","mt5_server","mt5_master_password","mt5_investor_password","status","admin_note"]:
-            if k in d: upd[k]=d[k]
-        if "account_size" in d: upd["account_size"]=clean(d.get("account_size"))
-        return ok(supabase.table("mt5_pool").update(upd).eq("id",mid).execute().data, "MT5 account updated")
-    except Exception as e: return bad(e)
-
-@app.route("/delete_mt5_account", methods=["POST"])
-def delete_mt5():
-    try:
-        mid=(request.json or {}).get("id")
-        if not mid: return bad("Missing MT5 account id")
-        return ok(supabase.table("mt5_pool").delete().eq("id",mid).execute().data, "MT5 account deleted")
-    except Exception as e: return bad(e)
-
-@app.route("/payouts", methods=["GET"])
-def payouts():
-    try: return jsonify(supabase.table("payouts").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_payout", methods=["POST"])
-def create_payout():
-    try:
-        d=request.json or {}; amount=clean(d.get("amount"))
-        if amount<=0: return bad("Invalid payout amount")
-        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "amount":amount,"bank_name":d.get("bank_name",""),"account_number":d.get("account_number",""),"account_name":d.get("account_name",""),
-             "status":"pending","note":d.get("note",""),"admin_note":"","requested_at":now_iso()}
-        return ok(supabase.table("payouts").insert(row).execute().data, "Payout request created")
-    except Exception as e: return bad(e)
-
-@app.route("/approve_payout", methods=["POST"])
-def approve_payout():
-    try:
-        d=request.json or {}; pid=d.get("id")
-        if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout approved")
-    except Exception as e: return bad(e)
-
-@app.route("/reject_payout", methods=["POST"])
-def reject_payout():
-    try:
-        d=request.json or {}; pid=d.get("id")
-        if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout rejected")
-    except Exception as e: return bad(e)
-
-@app.route("/mark_payout_paid", methods=["POST"])
-def mark_paid():
-    try:
-        d=request.json or {}; pid=d.get("id")
-        if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout marked paid")
-    except Exception as e: return bad(e)
-
-@app.route("/support_tickets", methods=["GET"])
-def support_tickets():
-    try: return jsonify(supabase.table("support_tickets").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_support_ticket", methods=["POST"])
-def create_ticket():
-    try:
-        d=request.json or {}; subject=str(d.get("subject","")).strip(); message=str(d.get("message","")).strip()
-        if not subject or not message: return bad("Subject and message are required")
-        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "subject":subject,"message":message,"status":"open","priority":d.get("priority","normal"),"admin_reply":"",
-             "created_at":now_iso(),"last_updated_at":now_iso()}
-        return ok(supabase.table("support_tickets").insert(row).execute().data, "Support ticket created")
-    except Exception as e: return bad(e)
-
-@app.route("/reply_support_ticket", methods=["POST"])
-def reply_ticket():
-    try:
-        d=request.json or {}; tid=d.get("id"); reply=str(d.get("admin_reply","")).strip()
-        if not tid: return bad("Missing ticket id")
-        if not reply: return bad("Admin reply is required")
-        return ok(supabase.table("support_tickets").update({"admin_reply":reply,"status":"replied","replied_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data, "Support ticket replied")
-    except Exception as e: return bad(e)
-
-@app.route("/close_support_ticket", methods=["POST"])
-def close_ticket():
-    try:
-        tid=(request.json or {}).get("id")
-        if not tid: return bad("Missing ticket id")
-        return ok(supabase.table("support_tickets").update({"status":"closed","closed_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data, "Support ticket closed")
-    except Exception as e: return bad(e)
-
-@app.route("/announcements", methods=["GET"])
-def announcements():
-    try: return jsonify(supabase.table("announcements").select("*").eq("status","active").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
-
-@app.route("/create_announcement", methods=["POST"])
-def create_announcement():
-    try:
-        d=request.json or {}; title=str(d.get("title","")).strip(); msg=str(d.get("message","")).strip()
-        if not title or not msg: return bad("Title and message are required")
-        row={"title":title,"message":msg,"type":d.get("type","public_notice"),"status":"active",
-             "show_on_landing":d.get("show_on_landing", True),"show_on_dashboard":d.get("show_on_dashboard", True),
-             "created_by":d.get("created_by","admin"),"created_at":now_iso()}
-        return ok(supabase.table("announcements").insert(row).execute().data, "Announcement created")
-    except Exception as e: return bad(e)
-
-@app.route("/disable_announcement", methods=["POST"])
-def disable_announcement():
-    try:
-        aid=(request.json or {}).get("id")
-        if not aid: return bad("Missing announcement id")
-        return ok(supabase.table("announcements").update({"status":"disabled"}).eq("id",aid).execute().data, "Announcement disabled")
-    except Exception as e: return bad(e)
-
-
-
-
-# ================================
-# NAIRAPIPS AUTO-PILOT MONITORING
-# FX BLUE / SNAPSHOT FOUNDATION
-# ================================
-
-MAX_DRAWDOWN_LIMIT = 20.0
-
-def _num(value, default=0.0):
-    try:
-        if value is None or value == "":
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-def _risk_zone(max_dd_used):
-    dd = _num(max_dd_used)
-    if dd >= 100:
-        return "breached"
-    if dd >= 91:
-        return "critical"
-    if dd >= 76:
-        return "danger"
-    if dd >= 51:
-        return "warning"
-    return "safe"
-
-def _priority_for_zone(zone):
-    return {"safe":"normal","warning":"medium","danger":"high","critical":"urgent","breached":"closed"}.get(zone, "normal")
-
-def _now_iso():
-    from datetime import datetime, timezone
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def _get_trader_by_id(trader_id):
-    res = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
-    data = getattr(res, "data", None) or []
-    return data[0] if data else None
 
-def _insert_monitoring_event(trader, event_type, zone, message, balance, equity, max_dd_used):
+def ok(data=None, message="ok", status=200):
+    res = jsonify({"success": True, "message": message, "data": data})
+    res.status_code = status
+    return res
+
+
+def bad(message, status=400):
+    res = jsonify({"success": False, "error": str(message)})
+    res.status_code = status
+    return res
+
+
+def require_main_api_admin():
+    """Validate the Admin bearer token with the main API before any recall write."""
+    auth = str(request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return None, bad("Admin authentication is required", 401)
     try:
-        supabase.table("monitoring_events").insert({
-            "trader_id": trader.get("id"),
-            "trader_name": trader.get("name"),
-            "email": trader.get("email"),
-            "mt5_login": trader.get("mt5_login"),
-            "event_type": event_type,
-            "risk_zone": zone,
-            "message": message,
-            "balance": balance,
-            "equity": equity,
-            "max_drawdown_used": max_dd_used
-        }).execute()
-    except Exception as e:
-        print("monitoring event insert failed:", e)
-
-
-def _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used):
-    zone = (zone or "safe").lower()
-    if zone == "breached":
-        return f"BREACH DETECTED: Maximum drawdown violation recorded. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
-    if zone == "critical":
-        return f"CRITICAL MODE: Account is very close to breach. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
-    if zone == "danger":
-        return f"DANGER ZONE: Drawdown pressure is high. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
-    if zone == "warning":
-        return f"WARNING ZONE: Account drawdown has entered warning level. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
-    return f"SAFE SNAPSHOT: Account remains within safe monitoring zone. Equity: {equity:,.2f}, Profit: {profit_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
-
-def _should_record_snapshot_event(old_zone, zone, max_dd_used):
-    """
-    Keeps timeline useful without flooding:
-    - always record zone changes
-    - always record critical/danger/breach
-    - record warning at meaningful points
-    - record safe snapshots only lightly
-    """
-    old_zone = (old_zone or "safe").lower()
-    zone = (zone or "safe").lower()
-
-    if zone != old_zone:
-        return True
-    if zone in ["breached", "critical", "danger"]:
-        return True
-    if zone == "warning" and max_dd_used >= 60:
-        return True
-    if zone == "safe" and max_dd_used in [0, 25, 50]:
-        return True
-    return False
-
-def _apply_monitoring_snapshot(trader, payload, source="manual"):
-    balance = _num(payload.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size"))))
-    equity = _num(payload.get("equity"), balance)
-    account_size = _num(trader.get("account_size"), balance)
-
-    profit = equity - account_size if account_size else _num(payload.get("profit"), 0)
-    profit_percent = (profit / account_size * 100) if account_size else 0
-
-    previous_highest = _num(trader.get("highest_equity"), 0)
-    previous_lowest = _num(trader.get("lowest_equity"), 0)
-
-    highest_equity = max(previous_highest, equity, account_size)
-    lowest_equity = min(previous_lowest, equity) if previous_lowest > 0 else equity
-
-    peak_base = max(highest_equity, account_size)
-    equity_damage = max(0, peak_base - lowest_equity)
-    drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
-    max_dd_used = (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0
-
-    zone = _risk_zone(max_dd_used)
-    priority = _priority_for_zone(zone)
-    old_zone = (trader.get("risk_zone") or "safe").lower()
-    old_status = (trader.get("status") or "").lower()
-
-    update_data = {
-        "balance": balance,
-        "equity": equity,
-        "profit": profit,
-        "profit_percent": profit_percent,
-        "drawdown": equity_damage,
-        "drawdown_percent": drawdown_percent,
-        "highest_equity": highest_equity,
-        "lowest_equity": lowest_equity,
-        "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size),
-        "last_equity_snapshot": equity,
-        "max_drawdown_used": max_dd_used,
-        "risk_zone": zone,
-        "critical_mode": zone in ["danger", "critical"],
-        "monitoring_priority": priority,
-        "last_sync_at": _now_iso()
-    }
-
-    if zone == "breached":
-        update_data.update({
-            "status": "breached",
-            "breach_time": trader.get("breach_time") or _now_iso(),
-            "breach_equity": equity,
-            "breach_reason": "Maximum drawdown violation recorded by NairaPips monitoring engine.",
-            "admin_note": "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
-            "mt5_access_disabled": True if zone == "breached" else False,
-"breach_detected_at": datetime.now(timezone.utc).isoformat() if zone == "breached" else trader.get("breach_detected_at"),
-        })
-
-    supabase.table("traders").update(update_data).eq("id", trader.get("id")).execute()
-
-    try:
-        supabase.table("monitoring_snapshots").insert({
-            "trader_id": trader.get("id"),
-            "trader_name": trader.get("name"),
-            "email": trader.get("email"),
-            "mt5_login": trader.get("mt5_login"),
-            "balance": balance,
-            "equity": equity,
-            "profit": profit,
-            "profit_percent": profit_percent,
-            "drawdown": equity_damage,
-            "drawdown_percent": drawdown_percent,
-            "max_drawdown_used": max_dd_used,
-            "risk_zone": zone,
-            "source": source,
-            "raw_data": payload
-        }).execute()
-    except Exception as e:
-        print("monitoring snapshot insert failed:", e)
-
-    # Auto Timeline + Evidence Population
-    # Every important snapshot now becomes readable evidence for admin/trader dashboards.
-    if _should_record_snapshot_event(old_zone, zone, round(max_dd_used)):
-        event_type = "monitoring_snapshot"
-        if zone != old_zone:
-            event_type = "risk_zone_change"
-        if zone == "critical":
-            event_type = "critical_mode"
-        if zone == "danger":
-            event_type = "danger_zone"
-        if zone == "breached":
-            event_type = "breach_detected"
-
-        _insert_monitoring_event(
-            trader,
-            event_type,
-            zone,
-            _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used),
-            balance,
-            equity,
-            max_dd_used
+        probe = urlrequest.Request(
+            MAIN_API_URL + "/admin_bootstrap",
+            headers={"Authorization": auth, "Accept": "application/json"},
+            method="GET",
         )
+        with urlrequest.urlopen(probe, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+        if payload.get("success") is False:
+            return None, bad("Invalid or expired admin token", 401)
+        return payload, None
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        print("RECALL ADMIN AUTH FAILED:", str(exc), flush=True)
+        return None, bad("Admin authentication could not be verified", 401)
 
-    if zone == "breached" and old_status != "breached":
-        _insert_monitoring_event(
-            trader,
-            "account_locked",
-            zone,
-            "Account locked permanently by NairaPips monitoring engine after maximum drawdown violation.",
-            balance,
-            equity,
-            max_dd_used
-        )
 
-    return {
-        "trader_id": trader.get("id"),
-        "balance": balance,
-        "equity": equity,
-        "profit": profit,
-        "profit_percent": profit_percent,
-        "drawdown_percent": drawdown_percent,
-        "max_drawdown_used": max_dd_used,
-        "risk_zone": zone,
-        "critical_mode": zone in ["danger", "critical"],
-        "monitoring_priority": priority,
-        "status": update_data.get("status", trader.get("status"))
+def num(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(str(v).replace("₦", "").replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def clean_login(v):
+    return str(v or "").strip()
+
+
+def valid_login(v):
+    v = clean_login(v)
+    return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL"]))
+
+
+ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active"}
+TERMINAL_ACCOUNT_WORDS = ("archived", "breached", "closed", "locked", "disabled", "passed", "reset")
+PURCHASE_BLOCK_WORDS = ("waiting", "reset", "archived", "breached", "disabled", "closed", "cancelled", "canceled", "rejected", "passed_review")
+POOL_ACTIVE_STATUSES = {"assigned", "active", "in_use", "used", "allocated", "assigned_active"}
+ACCOUNT_ORIGIN_FIELDS = ("account_origin", "source_type", "programme_type", "campaign_id", "grant_id", "referral_reward_id", "competition_id")
+NO_PURCHASE_AUDIT_KEYS = set()
+
+
+def is_active_monitoring_account(row):
+    status = str((row or {}).get("account_status") or (row or {}).get("status") or "").strip().lower()
+    if not row or status not in ACTIVE_ACCOUNT_STATUSES:
+        return False
+    if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
+        return False
+    # A verified breach is an irreversible lifecycle event for this exact account row.
+    # Removing a reversible lock or seeing a later recovered balance must never resurrect it.
+    if (row or {}).get("breached_at"):
+        return False
+    if (row or {}).get("archived_at") or (row or {}).get("reset_at"):
+        return False
+    if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"}:
+        return False
+    return valid_login((row or {}).get("mt5_login"))
+
+
+def bool_false(value):
+    return str(value).strip().lower() in {"false", "0", "no", "off"}
+
+
+def bool_true(value):
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def lifecycle_blob(row, keys):
+    return " ".join(str((row or {}).get(k) or "").strip().lower() for k in keys)
+
+
+def account_origin(account):
+    return {key: (account or {}).get(key) for key in ACCOUNT_ORIGIN_FIELDS if (account or {}).get(key) not in (None, "")}
+
+
+def log_lifecycle_inconsistency(reason, account=None, purchase=None, mt5_pool=None, trader=None):
+    evidence = {
+        "reason": reason,
+        "trader_id": (account or {}).get("trader_id") or (purchase or {}).get("trader_id") or (trader or {}).get("id"),
+        "trader_account_id": (account or {}).get("id") or (purchase or {}).get("trader_account_id"),
+        "purchase_id": (account or {}).get("purchase_id") or (purchase or {}).get("id"),
+        "mt5_login": clean_login((account or {}).get("mt5_login") or (purchase or {}).get("mt5_login")),
+        "account_status": (account or {}).get("account_status"),
+        "purchase_status": (purchase or {}).get("status"),
+        "purchase_lifecycle_state": (purchase or {}).get("lifecycle_state"),
+        "pool_status": (mt5_pool or {}).get("status"),
+        "trader_state": (trader or {}).get("challenge_state") or (trader or {}).get("status"),
+        "account_origin": account_origin(account),
     }
-
-@app.route("/register_fxblue", methods=["POST"])
-def register_fxblue():
-    data = request.get_json(force=True) or {}
-    trader_id = data.get("trader_id") or data.get("id")
-    if not trader_id:
-        return jsonify({"success": False, "error": "trader_id is required"}), 400
-
-    res = supabase.table("traders").update({
-        "fxblue_url": data.get("fxblue_url"),
-        "fxblue_account_id": data.get("fxblue_account_id")
-    }).eq("id", trader_id).execute()
-    return jsonify({"success": True, "data": getattr(res, "data", None)})
-
-@app.route("/monitoring_snapshot", methods=["POST"])
-def monitoring_snapshot():
-    data = request.get_json(force=True) or {}
-    trader_id = data.get("trader_id") or data.get("id")
-    if not trader_id:
-        return jsonify({"success": False, "error": "trader_id is required"}), 400
-    trader = _get_trader_by_id(trader_id)
-    if not trader:
-        return jsonify({"success": False, "error": "Trader not found"}), 404
-    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, data.get("source", "manual"))})
-
-@app.route("/sync_fxblue_account", methods=["POST"])
-def sync_fxblue_account():
-    data = request.get_json(force=True) or {}
-    trader_id = data.get("trader_id") or data.get("id")
-    if not trader_id:
-        return jsonify({"success": False, "error": "trader_id is required"}), 400
-    trader = _get_trader_by_id(trader_id)
-    if not trader:
-        return jsonify({"success": False, "error": "Trader not found"}), 404
-    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
-@app.route("/sync_trades", methods=["POST"])
-def sync_trades():
+    print("MONITORING LIFECYCLE INCONSISTENCY:", evidence, flush=True)
     try:
-        d = request.json or {}
-        trades = d.get("trades", [])
-
-        if not isinstance(trades, list):
-            return bad("trades must be a list")
-
-        saved = []
-
-        for t in trades:
-            row = {
-                "trader_id": t.get("trader_id"),
-                "trader_name": t.get("trader_name"),
-                "email": t.get("email"),
-                "mt5_login": str(t.get("mt5_login") or ""),
-                "symbol": t.get("symbol"),
-                "ticket": str(t.get("ticket") or ""),
-                "trade_type": t.get("trade_type"),
-                "volume": t.get("volume") or 0,
-                "open_price": t.get("open_price") or 0,
-                "current_price": t.get("current_price") or 0,
-                "sl": t.get("sl") or 0,
-                "tp": t.get("tp") or 0,
-                "profit": t.get("profit") or 0,
-                "swap": t.get("swap") or 0,
-                "commission": t.get("commission") or 0,
-                "status": t.get("status") or "open",
-                "opened_at": t.get("opened_at"),
-                "closed_at": t.get("closed_at"),
-                "synced_at": now_iso()
-            }
-
-            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
-
-            if existing:
-                saved.append(
-                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
-                )
-            else:
-                saved.append(
-                    supabase.table("trader_trades").insert(row).execute().data
-                )
-
-        return ok(saved, "Trades synced")
-
-    except Exception as e:
-        return bad(e)
-
-@app.route("/disable_mt5_access", methods=["POST"])
-def disable_mt5_access():
-    try:
-        d = request.json or {}
-
-        trader_id = d.get("trader_id")
-        mt5_login = str(d.get("mt5_login") or "")
-        reason = d.get("reason") or "This MT5 account breached NairaPips rules and is no longer payout eligible."
-
-        if not trader_id and not mt5_login:
-            return bad("trader_id or mt5_login is required")
-
-        update = {
-            "status": "breached",
-            "phase": "breached",
-            "monitoring_enabled": False,
-            "mt5_account_active": False,
-            "payout_eligible": False,
-            "admin_note": reason,
-            "updated_at": now_iso()
-        }
-
-        query = supabase.table("traders").update(update)
-
-        if trader_id:
-            res = query.eq("id", trader_id).execute()
-        else:
-            res = query.eq("mt5_login", mt5_login).execute()
-
-        return ok(res.data, "Breached MT5 account locked. Trader profile remains active.")
-
-    except Exception as e:
-        return bad(e)
-@app.route("/users_database", methods=["GET"])
-def users_database():
-    try:
-        status = request.args.get("status", "active")
-        search = request.args.get("search", "").strip()
-
-        q = supabase.table("traders").select(
-            "id,full_name,name,email,phone,whatsapp,country,status,phase,created_at,updated_at,marketing_deleted,marketing_consent,source"
-        ).order("created_at", desc=True)
-
-        if status == "deleted":
-            q = q.eq("marketing_deleted", True)
-        else:
-            q = q.or_("marketing_deleted.is.null,marketing_deleted.eq.false")
-
-        res = q.execute()
-        rows = getattr(res, "data", []) or []
-
-        if search:
-            s = search.lower()
-            rows = [
-                r for r in rows
-                if s in str(r.get("full_name") or r.get("name") or "").lower()
-                or s in str(r.get("email") or "").lower()
-                or s in str(r.get("phone") or "").lower()
-                or s in str(r.get("whatsapp") or "").lower()
-            ]
-
-        return jsonify(rows)
-
-    except Exception as e:
-        return bad(e)
-
-
-@app.route("/users_database/delete", methods=["POST"])
-def users_database_delete():
-    try:
-        d = request.json or {}
-        user_id = d.get("id")
-
-        if not user_id:
-            return bad("User id is required")
-
-        update = {
-            "marketing_deleted": True,
-            "deleted_at": now_iso(),
-            "updated_at": now_iso()
-        }
-
-        res = supabase.table("traders").update(update).eq("id", user_id).execute()
-        return ok(res.data, "User moved to deleted list")
-
-    except Exception as e:
-        return bad(e)
-
-
-@app.route("/users_database/restore", methods=["POST"])
-def users_database_restore():
-    try:
-        d = request.json or {}
-        user_id = d.get("id")
-
-        if not user_id:
-            return bad("User id is required")
-
-        update = {
-            "marketing_deleted": False,
-            "restored_at": now_iso(),
-            "updated_at": now_iso()
-        }
-
-        res = supabase.table("traders").update(update).eq("id", user_id).execute()
-        return ok(res.data, "User restored")
-
-    except Exception as e:
-        return bad(e)
-
-
-@app.route("/users_database/export", methods=["GET"])
-def users_database_export():
-    try:
-        field = request.args.get("field", "phone")
-
-        res = supabase.table("traders").select(
-            "email,phone,whatsapp,marketing_deleted,marketing_consent"
-        ).or_("marketing_deleted.is.null,marketing_deleted.eq.false").execute()
-
-        rows = getattr(res, "data", []) or []
-
-        values = []
-        for r in rows:
-            if r.get("marketing_consent") is False:
-                continue
-
-            value = r.get("whatsapp") or r.get("phone") if field == "phone" else r.get("email")
-
-            if value:
-                values.append(str(value).strip())
-
-        return jsonify({
-            "count": len(values),
-            "field": field,
-            "data": values,
-            "copy_text": "\n".join(values)
+        safe_insert("monitoring_events", {
+            "trader_id": evidence["trader_id"],
+            "trader_account_id": evidence["trader_account_id"],
+            "mt5_login": evidence["mt5_login"],
+            "event_type": "lifecycle_inconsistency",
+            "risk_zone": "investigate",
+            "message": reason,
+            "created_at": now_iso(),
         })
-
-    except Exception as e:
-        return bad(e)       
-@app.route("/trader_trades", methods=["GET"])
-def get_trader_trades():
-    try:
-        q = supabase.table("trader_trades") \
-            .select("*") \
-            .order("synced_at", desc=True) \
-            .execute()
-
-        return jsonify(getattr(q, "data", []) or [])
-
-    except Exception as e:
-        return bad(e)
-@app.route("/monitoring_events", methods=["GET"])
-def monitoring_events():
-    trader_id = request.args.get("trader_id")
-    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(100)
-    if trader_id:
-        query = query.eq("trader_id", trader_id)
-    res = query.execute()
-    return jsonify(getattr(res, "data", []) or [])
-
-@app.route("/monitoring_snapshots", methods=["GET"])
-def monitoring_snapshots():
-    trader_id = request.args.get("trader_id")
-    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(100)
-    if trader_id:
-        query = query.eq("trader_id", trader_id)
-    res = query.execute()
-    return jsonify(getattr(res, "data", []) or [])
-
-@app.route("/breach_evidence/<trader_id>", methods=["GET"])
-def breach_evidence(trader_id):
-    trader = _get_trader_by_id(trader_id)
-    if not trader:
-        return jsonify({"success": False, "error": "Trader not found"}), 404
-
-    events = supabase.table("monitoring_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
-    snapshots = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
-
-    return jsonify({"success": True, "data": {
-        "trader_id": trader_id,
-        "status": trader.get("status"),
-        "risk_zone": trader.get("risk_zone"),
-        "highest_equity": trader.get("highest_equity"),
-        "lowest_equity": trader.get("lowest_equity"),
-        "max_drawdown_used": trader.get("max_drawdown_used"),
-        "breach_time": trader.get("breach_time"),
-        "breach_equity": trader.get("breach_equity"),
-        "breach_reason": trader.get("breach_reason"),
-        "events": getattr(events, "data", []) or [],
-        "snapshots": getattr(snapshots, "data", []) or []
-    }})
-
-
-
-
-
-@app.route("/test_monitoring_timeline/<trader_id>", methods=["POST", "GET"])
-def test_monitoring_timeline(trader_id):
-    """
-    Creates a safe -> warning -> danger -> critical -> breach timeline for one trader.
-    Use only for testing the evidence system.
-    """
-    trader = _get_trader_by_id(trader_id)
-    if not trader:
-        return jsonify({"success": False, "error": "Trader not found"}), 404
-
-    size = _num(trader.get("account_size"), _num(trader.get("balance"), 1000000))
-
-    test_points = [
-        {"balance": size, "equity": size, "source": "timeline_test_safe"},
-        {"balance": size, "equity": size * 0.88, "source": "timeline_test_warning"},
-        {"balance": size, "equity": size * 0.84, "source": "timeline_test_danger"},
-        {"balance": size, "equity": size * 0.815, "source": "timeline_test_critical"},
-        {"balance": size, "equity": size * 0.79, "source": "timeline_test_breach"},
-    ]
-
-    results = []
-    for p in test_points:
-        trader = _get_trader_by_id(trader_id)
-        results.append(_apply_monitoring_snapshot(trader, p, p["source"]))
-
-    return jsonify({"success": True, "message": "Test monitoring timeline created", "data": results})
-
-
-
-
-
-# ================================
-# FX BLUE AUTO-FEED RECEIVER
-# Accepts live MT5/FXBlue snapshot values and feeds NairaPips monitoring engine.
-# ================================
-
-def _find_trader_for_fxblue(data):
-    trader_id = data.get("trader_id") or data.get("id")
-    if trader_id:
-        return _get_trader_by_id(trader_id)
-
-    mt5_login = str(data.get("mt5_login") or data.get("login") or data.get("account") or "").strip()
-    if mt5_login:
-        res = supabase.table("traders").select("*").eq("mt5_login", mt5_login).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        if rows:
-            return rows[0]
-
-    fxblue_account_id = str(data.get("fxblue_account_id") or data.get("account_id") or "").strip()
-    if fxblue_account_id:
-        res = supabase.table("traders").select("*").eq("fxblue_account_id", fxblue_account_id).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        if rows:
-            return rows[0]
-
-    email = str(data.get("email") or "").strip().lower()
-    if email:
-        res = supabase.table("traders").select("*").eq("email", email).limit(1).execute()
-        rows = getattr(res, "data", None) or []
-        if rows:
-            return rows[0]
-
-    return None
-
-def _normalize_fxblue_payload(data):
-    """
-    Accepts different naming styles from FXBlue bridge/EA/webhook:
-    balance, equity, floating_pl, closed_profit, login, account, mt5_login.
-    """
-    balance = data.get("balance") or data.get("Balance") or data.get("account_balance")
-    equity = data.get("equity") or data.get("Equity") or data.get("account_equity")
-    profit = data.get("profit") or data.get("Profit") or data.get("floating_pl") or data.get("floating_profit")
-
-    normalized = dict(data)
-    normalized["balance"] = _num(balance, 0)
-    normalized["equity"] = _num(equity, normalized["balance"])
-    if profit is not None and profit != "":
-        normalized["profit"] = _num(profit, 0)
-
-    normalized["mt5_login"] = data.get("mt5_login") or data.get("login") or data.get("account")
-    normalized["source"] = data.get("source", "fxblue_auto_feed")
-    return normalized
-
-@app.route("/fxblue_webhook", methods=["POST", "GET"])
-def fxblue_webhook():
-    """
-    Main automatic feed route.
-
-    It accepts either:
-    GET:
-      /fxblue_webhook?login=123456&balance=1000000&e equity=950000
-
-    POST JSON:
-      {
-        "login": "123456",
-        "balance": 1000000,
-        "equity": 950000,
-        "server": "Exness-MT5Trial9"
-      }
-
-    Optional security:
-      Set FXBLUE_WEBHOOK_SECRET in Render env.
-      Then send ?secret=YOUR_SECRET or header X-NAIRAPIPS-SECRET.
-    """
-    import os
-
-    expected_secret = os.getenv("FXBLUE_WEBHOOK_SECRET", "").strip()
-    if expected_secret:
-        supplied = (
-            request.headers.get("X-NAIRAPIPS-SECRET")
-            or request.args.get("secret")
-            or ""
-        ).strip()
-        if supplied != expected_secret:
-            return jsonify({"success": False, "error": "Unauthorized FXBlue feed"}), 401
-
-    if request.method == "GET":
-        data = dict(request.args)
-    else:
-        data = request.get_json(force=True, silent=True) or dict(request.form)
-
-    data = _normalize_fxblue_payload(data)
-    trader = _find_trader_for_fxblue(data)
-
-    if not trader:
-        return jsonify({
-            "success": False,
-            "error": "Trader not found. Send trader_id, mt5_login/login, fxblue_account_id, or email.",
-            "received": data
-        }), 404
-
-    result = _apply_monitoring_snapshot(trader, data, "fxblue_auto_feed")
-
-    # Update fxblue ID/server if sent
-    try:
-        extra = {}
-        if data.get("fxblue_account_id"):
-            extra["fxblue_account_id"] = data.get("fxblue_account_id")
-        if data.get("fxblue_url"):
-            extra["fxblue_url"] = data.get("fxblue_url")
-        if data.get("server") or data.get("mt5_server"):
-            extra["mt5_server"] = data.get("server") or data.get("mt5_server")
-        if extra:
-            supabase.table("traders").update(extra).eq("id", trader.get("id")).execute()
-    except Exception as e:
-        print("fxblue extra update failed:", e)
-
-    return jsonify({
-        "success": True,
-        "message": "FXBlue snapshot received and processed by NairaPips monitoring engine.",
-        "data": result
-    })
-
-@app.route("/fxblue_test/<mt5_login>", methods=["GET"])
-def fxblue_test(mt5_login):
-    """
-    Simple browser test route.
-    Example:
-    /fxblue_test/123456?balance=1000000&equity=950000
-    """
-    data = dict(request.args)
-    data["login"] = mt5_login
-    data["source"] = "fxblue_browser_test"
-
-    trader = _find_trader_for_fxblue(data)
-    if not trader:
-        return jsonify({"success": False, "error": "Trader not found for this MT5 login"}), 404
-
-    data = _normalize_fxblue_payload(data)
-    result = _apply_monitoring_snapshot(trader, data, "fxblue_browser_test")
-    return jsonify({"success": True, "data": result})
-@app.route("/debug/supabase", methods=["GET"])
-def debug_supabase():
-    try:
-        response = supabase.table("traders").select("id,name,mt5_login,mt5_server,mt5_investor_password,status,monitoring_enabled").limit(5).execute()
-
-        return jsonify({
-            "success": True,
-            "supabase_url": SUPABASE_URL,
-            "count": len(response.data or []),
-            "sample": response.data or []
-        }), 200
-
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "supabase_url": SUPABASE_URL,
-            "error": str(e)
-        }), 500
-@app.route("/api/admin/traders", methods=["GET"])
-def get_admin_traders():
-    try:
-        response = supabase.table("traders").select("*").execute()
-
-        return jsonify(response.data), 200
-
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-@app.get('/marketing_deleted_contacts')
-def marketing_deleted_contacts():
-    try:
-        res = supabase.table('marketing_deleted_contacts').select('contact_id').execute()
-        return jsonify(res.data or [])
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/marketing_deleted_contacts/save')
-def save_marketing_deleted_contacts():
-    try:
-        body = request.get_json(silent=True) or {}
-        contact_ids = [str(x) for x in body.get('contact_ids', []) if str(x).strip()]
-
-        # Replace the admin soft-delete list in Supabase.
-        supabase.table('marketing_deleted_contacts').delete().neq('contact_id', '__never__').execute()
-        if contact_ids:
-            rows = [{'contact_id': cid, 'deleted_by': 'admin'} for cid in sorted(set(contact_ids))]
-            supabase.table('marketing_deleted_contacts').insert(rows).execute()
-
-        return jsonify({'success': True, 'contact_ids': contact_ids})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.get('/referral_settings')
-def get_referral_settings():
-    try:
-        res = supabase.table('referral_settings').select('*').eq('id', 'main').limit(1).execute()
-        row = (res.data or [{}])[0]
-        data = {
-            'programName': row.get('program_name') or 'NairaPips Referral Program',
-            'baseUrl': row.get('base_url') or 'https://nairapips.com',
-            'defaultCode': row.get('default_code') or 'NAIRAPIPS',
-            'rebateType': row.get('rebate_type') or 'percent',
-            'rebateValue': str(row.get('rebate_value') or '10'),
-            'customerBonus': row.get('customer_bonus') or '0',
-            'cookieDays': str(row.get('cookie_days') or '30'),
-            'minPayout': str(row.get('min_payout') or '5000'),
-            'status': row.get('status') or 'active',
-            'publicMessage': row.get('public_message') or 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
-            'payoutRule': row.get('payout_rule') or 'Rebate is approved only after a referred trader pays and passes payment verification.'
-        }
-        return jsonify({'success': True, 'data': data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/referral_settings')
-def update_referral_settings():
-    try:
-        body = request.get_json(silent=True) or {}
-        row = {
-            'id': 'main',
-            'program_name': body.get('programName'),
-            'base_url': body.get('baseUrl'),
-            'default_code': body.get('defaultCode'),
-            'rebate_type': body.get('rebateType'),
-            'rebate_value': body.get('rebateValue') or 0,
-            'customer_bonus': body.get('customerBonus'),
-            'cookie_days': int(body.get('cookieDays') or 30),
-            'min_payout': body.get('minPayout') or 0,
-            'status': body.get('status'),
-            'public_message': body.get('publicMessage'),
-            'payout_rule': body.get('payoutRule')
-        }
-        supabase.table('referral_settings').upsert(row, on_conflict='id').execute()
-        return get_referral_settings()
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/referral_settings/reset')
-def reset_referral_settings():
-    try:
-        default_row = {
-            'id': 'main',
-            'program_name': 'NairaPips Referral Program',
-            'base_url': 'https://nairapips.com',
-            'default_code': 'NAIRAPIPS',
-            'rebate_type': 'percent',
-            'rebate_value': 10,
-            'customer_bonus': '0',
-            'cookie_days': 30,
-            'min_payout': 5000,
-            'status': 'active',
-            'public_message': 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
-            'payout_rule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
-        }
-        supabase.table('referral_settings').upsert(default_row, on_conflict='id').execute()
-        return get_referral_settings()
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-# ===== NAIRAPIPS STAFF RBAC ROUTES =====
-# Paste above: if __name__ == "__main__":
-
-@app.get('/staff_members')
-def staff_members():
-    try:
-        res = supabase.table('admin_staff_members').select('*').order('created_at', desc=True).execute()
-        rows = res.data or []
-        for r in rows:
-            r.pop('password', None)
-        return jsonify(rows)
-    except Exception as e:
-        return jsonify([])
-
-@app.post('/staff_login')
-def staff_login():
-    try:
-        data = request.get_json() or {}
-        username = (data.get('username') or '').strip()
-        password = data.get('password') or ''
-        res = supabase.table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
-        rows = res.data or []
-        if not rows:
-            return jsonify({'success': False, 'error': 'Invalid login'}), 401
-        staff = rows[0]
-        if (staff.get('status') or 'active') != 'active':
-            return jsonify({'success': False, 'error': 'Staff account is not active'}), 403
-        supabase.table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
-        audit_log(staff, 'auth', 'login', 'Staff logged in')
-        staff.pop('password', None)
-        return jsonify({'success': True, 'staff': staff})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/staff_members')
-def create_staff_member():
-    try:
-        data = request.get_json() or {}
-        payload = {
-            'name': data.get('name'),
-            'email': data.get('email'),
-            'username': data.get('username'),
-            'password': data.get('password'),
-            'role': data.get('role') or 'support',
-            'permissions': data.get('permissions') or {},
-            'status': data.get('status') or 'active'
-        }
-        res = supabase.table('admin_staff_members').insert(payload).execute()
-        return jsonify({'success': True, 'data': res.data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/staff_members/update')
-def update_staff_member():
-    try:
-        data = request.get_json() or {}
-        staff_id = data.get('id')
-        payload = {k: data.get(k) for k in ['name','email','role','permissions'] if k in data}
-        res = supabase.table('admin_staff_members').update(payload).eq('id', staff_id).execute()
-        return jsonify({'success': True, 'data': res.data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/staff_members/status')
-def staff_member_status():
-    try:
-        data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').update({'status': data.get('status')}).eq('id', data.get('id')).execute()
-        return jsonify({'success': True, 'data': res.data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/staff_members/password')
-def staff_member_password():
-    try:
-        data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').update({'password': data.get('password')}).eq('id', data.get('id')).execute()
-        return jsonify({'success': True, 'data': res.data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.post('/staff_members/delete')
-def staff_member_delete():
-    try:
-        data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').delete().eq('id', data.get('id')).execute()
-        return jsonify({'success': True, 'data': res.data})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.get('/audit_logs')
-def audit_logs():
-    try:
-        res = supabase.table('admin_audit_logs').select('*').order('created_at', desc=True).limit(100).execute()
-        return jsonify(res.data or [])
-    except Exception as e:
-        return jsonify([])
-
-def audit_log(staff, module, action, details=''):
-    try:
-        supabase.table('admin_audit_logs').insert({
-            'staff_id': str(staff.get('id','')),
-            'staff_name': staff.get('name'),
-            'username': staff.get('username'),
-            'role': staff.get('role'),
-            'module': module,
-            'action': action,
-            'details': details
-        }).execute()
     except Exception:
         pass
 
-# ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
-# Paste above: if __name__ == "__main__":
 
-@app.get('/payment_accounts')
-def payment_accounts():
+def log_no_purchase_monitoring_allowed(account):
+    key = str((account or {}).get("id") or "")
+    if not key or key in NO_PURCHASE_AUDIT_KEYS:
+        return
+    NO_PURCHASE_AUDIT_KEYS.add(key)
+    reason = "active account has no purchase_id; monitoring allowed from exact trader_account evidence"
+    evidence = {
+        "reason": reason,
+        "trader_id": (account or {}).get("trader_id"),
+        "trader_account_id": (account or {}).get("id"),
+        "purchase_id": None,
+        "mt5_login": clean_login((account or {}).get("mt5_login")),
+        "account_status": (account or {}).get("account_status"),
+        "account_origin": account_origin(account),
+    }
+    print("MONITORING NO-PURCHASE ACCOUNT ALLOWED:", evidence, flush=True)
     try:
-        res = supabase.table('payment_accounts').select('*').order('display_order', desc=False).execute()
-        return jsonify(res.data or [])
+        safe_insert("monitoring_events", {
+            "trader_id": evidence["trader_id"],
+            "trader_account_id": evidence["trader_account_id"],
+            "mt5_login": evidence["mt5_login"],
+            "event_type": "monitoring_allowed_no_purchase_id",
+            "risk_zone": "audit",
+            "message": reason,
+            "created_at": now_iso(),
+        })
+    except Exception:
+        pass
+
+
+def is_active_purchase_for_account(purchase, account):
+    if not purchase:
+        return False, "linked purchase not found"
+    if str(purchase.get("id") or "") != str((account or {}).get("purchase_id") or ""):
+        return False, "purchase_id mismatch"
+    if str(purchase.get("trader_id") or "") != str((account or {}).get("trader_id") or ""):
+        return False, "purchase trader_id mismatch"
+    purchase_account_id = str(purchase.get("trader_account_id") or "").strip()
+    if purchase_account_id and purchase_account_id != str((account or {}).get("id") or ""):
+        return False, "purchase linked to a different trader_account_id"
+    purchase_login = clean_login(purchase.get("mt5_login"))
+    account_login = clean_login((account or {}).get("mt5_login"))
+    if purchase_login and purchase_login != account_login:
+        return False, "purchase mt5_login mismatch"
+    purchase_pool_id = str(purchase.get("mt5_pool_id") or purchase.get("assigned_mt5_id") or "").strip()
+    account_pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    if purchase_pool_id and account_pool_id and purchase_pool_id != account_pool_id:
+        return False, "purchase mt5_pool_id mismatch"
+    blob = lifecycle_blob(purchase, ["status", "payment_status", "lifecycle_state", "stage", "phase", "admin_note"])
+    if any(word in blob for word in PURCHASE_BLOCK_WORDS):
+        return False, "purchase lifecycle is not monitorable"
+    return True, "purchase active"
+
+
+def is_active_pool_for_account(mt5_pool, account):
+    pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    if not pool_id:
+        return True, "no mt5_pool_id on account"
+    if not mt5_pool:
+        return False, "linked mt5_pool row not found"
+    status = str(mt5_pool.get("status") or "").strip().lower()
+    if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
+        return False, "mt5_pool is terminal"
+    if status and status not in POOL_ACTIVE_STATUSES:
+        return False, "mt5_pool status is not active"
+    pool_account_id = str(mt5_pool.get("trader_account_id") or "").strip()
+    if pool_account_id and pool_account_id != str((account or {}).get("id") or ""):
+        return False, "mt5_pool linked to a different trader_account_id"
+    pool_trader_id = str(mt5_pool.get("assigned_trader_id") or mt5_pool.get("trader_id") or "").strip()
+    if pool_trader_id and pool_trader_id != str((account or {}).get("trader_id") or ""):
+        return False, "mt5_pool linked to a different trader"
+    pool_login = clean_login(mt5_pool.get("mt5_login"))
+    account_login = clean_login((account or {}).get("mt5_login"))
+    if pool_login and pool_login != account_login:
+        return False, "mt5_pool mt5_login mismatch"
+    return True, "mt5_pool active"
+
+
+def monitoring_eligibility(account, purchase=None, mt5_pool=None, trader=None, require_server=True):
+    if not is_active_monitoring_account(account):
+        return False, "account is not monitorable"
+    if require_server and not str((account or {}).get("mt5_server") or "").strip():
+        return False, "account has no mt5_server"
+    if bool_false((account or {}).get("monitoring_enabled")):
+        return False, "account monitoring_enabled is false"
+    if bool_true((account or {}).get("mt5_access_disabled")):
+        return False, "account mt5_access_disabled is true"
+    if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
+        return False, "account is superseded"
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    if purchase_id:
+        ok_purchase, reason = is_active_purchase_for_account(purchase, account)
+        if not ok_purchase:
+            return False, reason
+    ok_pool, reason = is_active_pool_for_account(mt5_pool, account)
+    if not ok_pool:
+        return False, reason
+    if trader:
+        t_blob = lifecycle_blob(trader, ["challenge_state", "status", "phase"])
+        if any(word in t_blob for word in ("waiting", "reset", "breached", "archived", "disabled", "closed", "passed_review")):
+            log_lifecycle_inconsistency("trader-level lifecycle disagrees with eligible active account; account remains monitorable", account, purchase, mt5_pool, trader)
+    if not purchase_id:
+        log_no_purchase_monitoring_allowed(account)
+    return True, "eligible"
+
+
+def fetch_trader_by_id(trader_id):
+    try:
+        if not trader_id:
+            return {}
+        rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
     except Exception as e:
-        return jsonify([])
+        print("TRADER FETCH ERROR:", e)
+        return {}
 
-@app.post('/save_payment_accounts')
-def save_payment_accounts():
+
+def fetch_purchase_by_id(purchase_id):
     try:
-        body = request.get_json(silent=True) or {}
-        accounts = body.get('accounts', []) or []
+        if not purchase_id:
+            return {}
+        rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("PURCHASE FETCH ERROR:", e)
+        return {}
 
-        clean_rows = []
-        for idx, account in enumerate(accounts, start=1):
-            row = {
-                'label': str(account.get('label') or f'Payment Account {idx}').strip(),
-                'bank_name': str(account.get('bank_name') or '').strip(),
-                'account_name': str(account.get('account_name') or '').strip(),
-                'account_number': str(account.get('account_number') or '').strip(),
-                'account_type': str(account.get('account_type') or 'Bank Transfer').strip(),
-                'instructions': str(account.get('instructions') or 'Upload your proof of payment after transfer so admin can verify and activate your challenge.').strip(),
-                'status': str(account.get('status') or 'active').strip(),
-                'display_order': int(account.get('display_order') or idx)
+
+def fetch_pool_by_id(pool_id):
+    try:
+        if not pool_id:
+            return {}
+        rows = supabase.table("mt5_pool").select("*").eq("id", pool_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 POOL FETCH ERROR:", e)
+        return {}
+
+
+def account_is_eligible(account, caches=None, require_server=True):
+    caches = caches if isinstance(caches, dict) else {}
+    purchases = caches.setdefault("purchases", {})
+    pools = caches.setdefault("pools", {})
+    traders = caches.setdefault("traders", {})
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    pool_id = str((account or {}).get("mt5_pool_id") or "").strip()
+    trader_id = str((account or {}).get("trader_id") or "").strip()
+    if purchase_id and purchase_id not in purchases:
+        purchases[purchase_id] = fetch_purchase_by_id(purchase_id)
+    if pool_id and pool_id not in pools:
+        pools[pool_id] = fetch_pool_by_id(pool_id)
+    if trader_id and trader_id not in traders:
+        traders[trader_id] = fetch_trader_by_id(trader_id)
+    eligible, reason = monitoring_eligibility(
+        account,
+        purchases.get(purchase_id) or {},
+        pools.get(pool_id) or {},
+        traders.get(trader_id) or {},
+        require_server=require_server,
+    )
+    if not eligible:
+        log_lifecycle_inconsistency(reason, account, purchases.get(purchase_id) or {}, pools.get(pool_id) or {}, traders.get(trader_id) or {})
+    return eligible, reason
+
+
+def eligible_accounts_without_login_ambiguity(rows, context="monitoring"):
+    caches = {}
+    eligible_rows = []
+    by_login = {}
+    for row in rows or []:
+        eligible, _reason = account_is_eligible(row, caches)
+        if not eligible:
+            continue
+        login = clean_login(row.get("mt5_login"))
+        by_login.setdefault(login, []).append(row)
+    for login, group in by_login.items():
+        if len(group) == 1:
+            eligible_rows.append(group[0])
+            continue
+        for row in group:
+            log_lifecycle_inconsistency(
+                "mt5_login resolves to multiple eligible active accounts; exact trader_account_id required",
+                row,
+                caches.get("purchases", {}).get(str(row.get("purchase_id") or "").strip()) or {},
+                caches.get("pools", {}).get(str(row.get("mt5_pool_id") or "").strip()) or {},
+                caches.get("traders", {}).get(str(row.get("trader_id") or "").strip()) or {},
+            )
+            print(f"MONITORING {context.upper()} EXCLUDED AMBIGUOUS LOGIN:", {"mt5_login": login, "trader_account_id": row.get("id")}, flush=True)
+    return eligible_rows
+
+
+
+_RULE_CACHE = {}
+_RULE_CACHE_SECONDS = 60
+
+def fetch_plan_by_id(plan_id):
+    try:
+        if not plan_id:
+            return {}
+        rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("PLAN FETCH ERROR:", e)
+        return {}
+
+def _rule_cache_get(key):
+    row = _RULE_CACHE.get(key)
+    if not row:
+        return None
+    ts, value = row
+    if time.time() - ts > _RULE_CACHE_SECONDS:
+        _RULE_CACHE.pop(key, None)
+        return None
+    return value
+
+def _rule_cache_set(key, value):
+    _RULE_CACHE[key] = (time.time(), value)
+    return value
+
+def resolve_account_rules(account, stage=None):
+    """Resolve exact commercial rules for THIS trader_account.
+
+    Authority order:
+      1) frozen trader_accounts values,
+      2) linked challenge purchase,
+      3) linked challenge plan.
+
+    NairaPips has multiple commercial rule sets (including 10% and 15%
+    targets and plan-specific DD). Missing authority must never be converted
+    into a guessed pass/breach rule.
+    """
+    account = account or {}
+    stage = str(stage or account.get("stage") or "phase1").strip().lower()
+    cache_key = "rules:" + str(account.get("id") or account.get("mt5_login") or "")
+    cached = _rule_cache_get(cache_key)
+    if cached:
+        return dict(cached)
+
+    purchase = {}
+    plan = {}
+    purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+    if purchase_id:
+        purchase = fetch_purchase_by_id(purchase_id) or {}
+
+    plan_id = str(
+        account.get("plan_id")
+        or purchase.get("plan_id")
+        or purchase.get("challenge_plan_id")
+        or ""
+    ).strip()
+    if plan_id:
+        plan = fetch_plan_by_id(plan_id) or {}
+
+    def first_num(*values):
+        for v in values:
+            if v not in (None, ""):
+                n = num(v, None)
+                if n is not None and n > 0:
+                    return float(n)
+        return None
+
+    dd_limit = first_num(
+        account.get("dd_limit_percent"),
+        account.get("max_drawdown"),
+        account.get("max_drawdown_percent"),
+        purchase.get("dd_limit_percent"),
+        purchase.get("max_drawdown"),
+        purchase.get("max_drawdown_percent"),
+        plan.get("dd_limit_percent"),
+        plan.get("max_drawdown"),
+        plan.get("max_drawdown_percent"),
+        plan.get("total_dd"),
+    )
+    dd_authority_present = dd_limit is not None
+
+    if stage == "phase1":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            account.get("phase1_target"),
+            purchase.get("target_percent"),
+            purchase.get("phase1_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
+            plan.get("phase1_target"),
+            plan.get("profit_target"),
+        )
+    elif stage == "phase2":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            account.get("phase2_target"),
+            purchase.get("target_percent"),
+            purchase.get("phase2_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
+            plan.get("phase2_target"),
+            plan.get("profit_target"),
+        )
+    else:
+        target = 0.0
+
+    target_authority_present = (stage not in {"phase1", "phase2"}) or (target is not None)
+
+    second_life_enabled = bool_true(
+        purchase.get("second_life_enabled")
+        if purchase.get("second_life_enabled") is not None
+        else plan.get("second_life_enabled")
+    )
+
+    one_phase = second_life_enabled
+    journey_text = " ".join(str(x or "") for x in (
+        account.get("challenge_journey"),
+        purchase.get("challenge_journey"),
+        purchase.get("journey_stages"),
+        purchase.get("route"),
+        plan.get("challenge_journey"),
+        plan.get("journey_stages"),
+    )).lower()
+    if "one_phase" in journey_text or "1-phase" in journey_text or "1 phase" in journey_text:
+        one_phase = True
+
+    rules = {
+        "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "dd_authority_present": bool(dd_authority_present),
+        "target_percent": float(target) if target is not None else 0.0,
+        "target_authority_present": bool(target_authority_present),
+        "second_life_enabled": bool(second_life_enabled),
+        "one_phase": bool(one_phase),
+        "purchase_id": purchase_id or None,
+        "plan_id": plan_id or None,
+        "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"),
+    }
+    return _rule_cache_set(cache_key, rules)
+
+
+def target_for_stage(stage):
+    # Compatibility only. Never use this as commercial rule authority.
+    return 0.0
+
+
+def active_state(stage):
+    return "funded_active" if str(stage).lower() == "funded" else f"{stage}_active"
+
+
+def waiting_after_pass(stage):
+    stage = str(stage or "").strip().lower()
+    if stage == "phase1":
+        return "phase2_waiting_mt5", "phase2"
+    if stage == "phase2":
+        return "funded_waiting_mt5", "funded"
+    return "passed_review", stage or "phase1"
+
+
+def risk_zone(current_dd_percent, dd_limit_percent=None):
+    d = num(current_dd_percent)
+    limit = num(dd_limit_percent, MAX_DD_PERCENT or 20)
+    if limit <= 0:
+        limit = 20.0
+    if d >= limit:
+        return "breached"
+    if d >= limit * 0.90:
+        return "critical"
+    if d >= limit * 0.75:
+        return "danger"
+    if d >= limit * 0.50:
+        return "warning"
+    return "safe"
+
+
+def static_dd(start_balance, equity):
+    start = num(start_balance)
+    eq = num(equity)
+    if start <= 0:
+        return 0.0
+    return round(max(((start - eq) / start) * 100, 0.0), 2)
+
+
+def dd_used_from_static(dd_percent, dd_limit_percent=None):
+    limit = num(dd_limit_percent, MAX_DD_PERCENT or 20)
+    if limit <= 0:
+        return 0.0
+    return round(max((num(dd_percent) / limit) * 100, 0.0), 2)
+
+
+def fetch_traders_by_ids(ids):
+    ids = [str(x) for x in ids if x]
+    if not ids:
+        return {}
+    out = {}
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i+100]
+        try:
+            rows = supabase.table("traders").select("*").in_("id", chunk).execute().data or []
+            for r in rows:
+                out[str(r.get("id"))] = r
+        except Exception as e:
+            print("TRADER BATCH FETCH ERROR:", e)
+    return out
+
+
+def get_account_by_id_or_login(account_id=None, mt5_login=None):
+    caches = {}
+    try:
+        if account_id:
+            rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+            account = rows[0] if rows else None
+            if not account:
+                return None
+            login = clean_login(mt5_login)
+            if login and clean_login(account.get("mt5_login")) != login:
+                log_lifecycle_inconsistency("snapshot/trade supplied trader_account_id but mt5_login does not match", account)
+                return None
+            eligible, _reason = account_is_eligible(account, caches)
+            if eligible:
+                return rows[0]
+            return None
+        login = clean_login(mt5_login)
+        if login:
+            rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(10).execute().data or []
+            eligible_rows = []
+            for r in rows:
+                eligible, _reason = account_is_eligible(r, caches)
+                if eligible:
+                    eligible_rows.append(r)
+            if len(eligible_rows) == 1:
+                return eligible_rows[0]
+            if len(eligible_rows) > 1:
+                for r in eligible_rows:
+                    log_lifecycle_inconsistency("mt5_login resolves to multiple eligible active accounts; exact trader_account_id required", r)
+                return None
+    except Exception as e:
+        print("ACCOUNT FETCH ERROR:", e)
+    return None
+
+
+def safe_insert(table, payload):
+    work = dict(payload or {})
+    removed = []
+    for _ in range(24):
+        try:
+            return supabase.table(table).insert(work).execute().data or []
+        except Exception as e:
+            # Evidence tables have evolved over time. Remove only a column that PostgREST
+            # explicitly reports as unavailable; never guess or drop core account data here.
+            import re
+            text = str(e or '')
+            m = re.search(r"Could not find the '([^']+)' column", text, flags=re.I)
+            missing = m.group(1) if m else None
+            if missing and missing in work:
+                removed.append(missing)
+                work.pop(missing, None)
+                print(f"ADAPTIVE INSERT {table}: removed unavailable column {missing}; retrying", flush=True)
+                continue
+            print(f"SAFE INSERT FAILED {table}:", e, flush=True)
+            return []
+    print(f"SAFE INSERT FAILED {table}: too many unavailable columns removed={removed}", flush=True)
+    return []
+
+
+def safe_update(table, payload, col, val):
+    try:
+        return supabase.table(table).update(payload).eq(col, val).execute().data or []
+    except Exception as e:
+        print(f"SAFE UPDATE FAILED {table}.{col}:", e)
+        return []
+
+
+# 2026-09-03 FORENSIC FIX V2 — adaptive verified persistence for live MT5 snapshots/breaches.
+# IMPORTANT: the production database has compatibility triggers that validate derived DD fields.
+# A narrow "core only" retry can therefore still fail when it changes balance/equity without also
+# updating the matching derived field (for example worst_static_drawdown_percent).
+# Instead, retry the SAME coherent snapshot while removing only columns PostgREST explicitly says
+# do not exist. This preserves trigger-consistent values and prevents one new optional column from
+# blocking every account snapshot.
+
+def _np_missing_column_from_error(exc):
+    text = str(exc or '')
+    import re
+    patterns = [
+        r"Could not find the '([^']+)' column",
+        r'Could not find the "([^"]+)" column',
+        r"column ['\"]?([A-Za-z0-9_]+)['\"]? does not exist",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _np_adaptive_table_update(table, match_col, match_val, payload, max_missing_columns=32):
+    work = dict(payload or {})
+    removed = []
+    last_error = None
+    for _ in range(max_missing_columns + 1):
+        if not work:
+            return False, removed, last_error or 'empty_payload'
+        try:
+            supabase.table(table).update(work).eq(match_col, match_val).execute()
+            return True, removed, None
+        except Exception as e:
+            last_error = e
+            missing = _np_missing_column_from_error(e)
+            if missing and missing in work:
+                removed.append(missing)
+                work.pop(missing, None)
+                print(f"ADAPTIVE {table} UPDATE: removed unavailable column {missing}; retrying coherent snapshot", flush=True)
+                continue
+            return False, removed, e
+    return False, removed, last_error
+
+
+def verified_account_update(account_id, payload):
+    account_id = str(account_id or '').strip()
+    if not account_id:
+        return False, {}, 'missing_account_id'
+
+    ok, removed, err = _np_adaptive_table_update('trader_accounts', 'id', account_id, payload)
+    if not ok:
+        print('VERIFIED ACCOUNT ADAPTIVE UPDATE FAILED:', err, flush=True)
+        return False, {}, f'adaptive_update_failed:{err}'
+
+    try:
+        rows = supabase.table('trader_accounts').select('*').eq('id', account_id).limit(1).execute().data or []
+        if not rows:
+            return False, {}, 'readback_missing'
+        mode = 'adaptive_full' if removed else 'full'
+        if removed:
+            print(f"VERIFIED ACCOUNT UPDATE OK after removing unavailable columns: {removed}", flush=True)
+        return True, rows[0], mode
+    except Exception as e:
+        print('VERIFIED ACCOUNT READBACK FAILED:', e, flush=True)
+        return False, {}, f'readback_failed:{e}'
+
+def verified_trader_update(trader_id, payload):
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return False
+    try:
+        supabase.table("traders").update(payload).eq("id", trader_id).execute()
+        rows = supabase.table("traders").select("id").eq("id", trader_id).limit(1).execute().data or []
+        return bool(rows)
+    except Exception as e:
+        print("VERIFIED TRADER UPDATE FAILED:", e, flush=True)
+        return False
+
+
+def alert_once(account, event_type, title, message, severity="info", snapshot=None):
+    """Create admin action evidence without depending on the main API."""
+    account_id = account.get("id") if account else None
+    trader_id = account.get("trader_id") if account else None
+    key = f"{event_type}:{account_id or ''}:{clean_login((account or {}).get('mt5_login'))}"
+    payload = {
+        "trader_id": trader_id,
+        "trader_account_id": account_id,
+        "mt5_login": clean_login((account or {}).get("mt5_login")),
+        "event_type": event_type,
+        "alert_type": event_type,
+        "title": title,
+        "message": message,
+        "severity": severity,
+        "status": "unread",
+        "dedupe_key": key,
+        "payload": snapshot or {},
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    # Try common alert/event tables. Fail-safe: monitoring_events always records evidence.
+    for table in ["monitoring_alerts", "account_alerts", "admin_alerts"]:
+        try:
+            # If a unique dedupe_key exists, upsert prevents alert spam. If not, insert may still work.
+            supabase.table(table).upsert(payload, on_conflict="dedupe_key").execute()
+            return True
+        except Exception:
+            try:
+                supabase.table(table).insert(payload).execute()
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def apply_intelligence(account, snapshot):
+    if not account:
+        return None
+    if not is_active_monitoring_account(account):
+        print("MONITORING SNAPSHOT IGNORED FOR NON-ACTIVE ACCOUNT:", {"account_id": account.get("id"), "trader_id": account.get("trader_id"), "mt5_login": account.get("mt5_login"), "account_status": account.get("account_status")}, flush=True)
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "ignored": True, "reason": "account_not_active_for_monitoring"}
+
+    start = num(
+        account.get("start_balance")
+        or account.get("account_size")
+        or snapshot.get("starting_balance")
+        or snapshot.get("initial_balance")
+        or snapshot.get("balance")
+        or 0
+    )
+
+    # MT5 bridges do not all use the same field names. Normalize every known
+    # live-balance/equity alias before applying intelligence.
+    raw_balance = next((
+        snapshot.get(key)
+        for key in (
+            "current_balance", "balance", "account_balance", "Balance",
+            "ACCOUNT_BALANCE", "mt5_balance", "live_balance"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
+
+    raw_closed_profit = next((
+        snapshot.get(key)
+        for key in (
+            "closed_profit", "closed_pnl", "realized_profit",
+            "realised_profit", "net_closed_profit"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
+
+    if raw_balance not in (None, ""):
+        current_balance = num(raw_balance, start)
+    elif raw_closed_profit not in (None, "") and start:
+        current_balance = round(start + num(raw_closed_profit), 2)
+    else:
+        current_balance = num(account.get("current_balance"), start)
+
+    raw_equity = next((
+        snapshot.get(key)
+        for key in (
+            "current_equity", "equity", "account_equity", "Equity",
+            "ACCOUNT_EQUITY", "mt5_equity", "live_equity"
+        )
+        if snapshot.get(key) not in (None, "")
+    ), None)
+    equity = num(
+        raw_equity if raw_equity not in (None, "")
+        else account.get("current_equity")
+        if account.get("current_equity") not in (None, "")
+        else current_balance,
+        current_balance
+    )
+    stage = str(account.get("stage") or snapshot.get("phase_label") or "phase1").strip().lower()
+    rules = resolve_account_rules(account, stage)
+    target = num(rules.get("target_percent"), 0.0)
+    target_authority_present = bool(rules.get("target_authority_present"))
+    dd_limit_percent = num(rules.get("dd_limit_percent"), 0.0)
+    dd_authority_present = bool(rules.get("dd_authority_present"))
+    breach_level = round(start * (1 - dd_limit_percent / 100), 2) if start and dd_authority_present and dd_limit_percent > 0 else 0.0
+
+    old_high = num(account.get("highest_equity") or start)
+    old_low = num(account.get("lowest_equity") or start)
+    snap_high = num(snapshot.get("highest_equity") or 0)
+    snap_low = num(snapshot.get("lowest_equity") or snapshot.get("recorded_lowest_equity") or 0)
+
+    highest = round(max(start, equity, old_high, snap_high), 2)
+    low_candidates = [x for x in [start, equity, old_low, snap_low] if x and x > 0]
+    lowest = round(min(low_candidates), 2) if low_candidates else equity
+
+    current_dd = static_dd(start, equity)
+    current_dd_used = dd_used_from_static(current_dd, dd_limit_percent) if dd_authority_present else 0.0
+    worst_dd = static_dd(start, lowest)
+    worst_dd_used = dd_used_from_static(worst_dd, dd_limit_percent) if dd_authority_present else 0.0
+    dd_remaining = round(max(dd_limit_percent - current_dd, 0), 2) if dd_authority_present else 0.0
+    zone = risk_zone(current_dd, dd_limit_percent) if dd_authority_present else "authority_missing"
+
+    # Current payout/closed profit follows the actual MT5 balance.
+    # highest_equity remains pass-target evidence only.
+    profit = round(current_balance - start, 2) if start else 0.0
+    profit_percent = round((profit / start) * 100, 2) if start else 0.0
+    current_profit = profit
+    current_profit_percent = profit_percent
+    floating_profit = round(equity - current_balance, 2)
+    target_equity = round(start * (1 + target / 100), 2) if target else 0.0
+    pass_progress = round(max(0, profit_percent / target * 100), 2) if target else 0.0
+
+    target_hit = bool(target_authority_present and target and highest >= target_equity)
+
+    # TERMINAL EVENT AUTHORITY:
+    # A real static DD breach must never be erased because the account also touched
+    # its profit target. Use the worst evidence seen while this account is still live.
+    breached_by_equity = bool(dd_authority_present and start and equity <= breach_level)
+    breached_by_balance = bool(dd_authority_present and start and current_balance <= breach_level)
+    breached_by_recorded_low = bool(dd_authority_present and start and lowest <= breach_level)
+    terminal_breach_recorded = bool(account.get("breached_at"))
+    breached = bool(terminal_breach_recorded or breached_by_equity or breached_by_balance or breached_by_recorded_low)
+
+    status = str(account.get("account_status") or "assigned_active").lower()
+    phase_pass_status = ""
+    lifecycle_state = None
+    next_phase = stage
+
+    if breached:
+        zone = "breached"
+        status = "breached_archived"
+        lifecycle_state = "breached"
+        next_phase = stage
+        phase_pass_status = ""
+    elif target_hit:
+        zone = "passed"
+        phase_pass_status = f"{stage}_passed"
+        status = f"archived_{stage}" if stage in {"phase1", "phase2"} else "passed"
+        if stage == "phase1" and rules.get("one_phase"):
+            lifecycle_state, next_phase = "funded_waiting_mt5", "funded"
+        else:
+            lifecycle_state, next_phase = waiting_after_pass(stage)
+
+    update = {
+        "current_balance": current_balance,
+        "current_equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "current_profit": current_profit,
+        "current_profit_percent": current_profit_percent,
+        "highest_equity": highest,
+        "lowest_equity": lowest,
+        "absolute_drawdown_percent": current_dd,
+        "drawdown_percent": current_dd,
+        "dd_used_percent": current_dd_used,
+        "max_drawdown_used": current_dd_used,
+        "worst_static_drawdown_percent": worst_dd,
+        "worst_dd_used_percent": worst_dd_used,
+        "dd_remaining_percent": dd_remaining,
+        "breach_equity_level": breach_level,
+        "target_percent": target,
+        "target_authority_present": target_authority_present,
+        "dd_authority_present": dd_authority_present,
+        "target_equity": target_equity,
+        "pass_progress_percent": pass_progress,
+        "risk_zone": zone,
+        "phase_pass_status": phase_pass_status or account.get("phase_pass_status") or "",
+        "last_sync_at": snapshot.get("timestamp") or now_iso(),
+        "updated_at": now_iso(),
+    }
+    if target_hit or breached:
+        update["account_status"] = status
+        update["monitoring_enabled"] = False
+        update["archived_at"] = now_iso()
+        update["archive_reason"] = snapshot.get("reason") or ("Static drawdown breached" if breached else "Target reached")
+        if breached:
+            update["breached_at"] = account.get("breached_at") or now_iso()
+            update["breach_reason"] = snapshot.get("reason") or (
+                f"Static {dd_limit_percent:g}% drawdown breached. "
+                f"Lowest/current evidence reached {min(lowest, equity, current_balance):,.2f} "
+                f"against breach level {breach_level:,.2f}."
+            )
+            update["phase_pass_status"] = ""
+            update["passed_at"] = None
+        elif target_hit:
+            update["passed_at"] = now_iso()
+
+    account_write_ok, persisted_account, account_write_mode = verified_account_update(account.get("id"), update)
+    if not account_write_ok:
+        print(f"CRITICAL SNAPSHOT ACCOUNT WRITE FAILED mt5={account.get('mt5_login')} account_id={account.get('id')}", flush=True)
+
+    trader_update = {
+        "equity": equity,
+        "balance": current_balance,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "drawdown_percent": current_dd,
+        "max_drawdown_used": current_dd_used,
+        "updated_at": now_iso(),
+    }
+    if target_hit or breached:
+        trader_update.update({
+            "challenge_state": lifecycle_state,
+            "phase": next_phase,
+            "status": "breached" if breached else "active",
+            "mt5_access_disabled": True,
+            "monitoring_enabled": False,
+            "phase_pass_status": phase_pass_status,
+            "lifecycle_updated_at": now_iso(),
+        })
+    trader_write_ok = verified_trader_update(account.get("trader_id"), trader_update)
+
+    event = {
+        "trader_id": account.get("trader_id"),
+        "trader_account_id": account.get("id"),
+        "mt5_login": clean_login(account.get("mt5_login") or snapshot.get("mt5_login")),
+        "event_type": "breached" if breached else ("phase_passed" if target_hit else "snapshot"),
+        "risk_zone": zone,
+        "phase_label": stage,
+        "phase_pass_status": phase_pass_status,
+        "balance": current_balance,
+        "equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "current_profit": current_profit,
+        "current_profit_percent": current_profit_percent,
+        "drawdown_percent": current_dd,
+        "dd_used_percent": current_dd_used,
+        "max_drawdown_used": current_dd_used,
+        "worst_static_drawdown_percent": worst_dd,
+        "worst_dd_used_percent": worst_dd_used,
+        "highest_equity": highest,
+        "lowest_equity": lowest,
+        "breach_equity_level": breach_level,
+        "target_percent": target,
+        "target_equity": target_equity,
+        "pass_progress_percent": pass_progress,
+        "message": snapshot.get("reason") or "Monitoring snapshot applied",
+        "intelligence_version": "NIC_SPRINT1",
+        "intelligence_event_id": f"{account.get('id')}:{snapshot.get('timestamp') or now_iso()}",
+        "starting_balance": start,
+        "current_balance": current_balance,
+        "current_equity": equity,
+        "floating_profit": floating_profit,
+        "drawdown_amount": max(0, start - min(current_balance, equity)),
+        "drawdown_remaining_percent": max(0, dd_limit_percent - current_dd),
+        "dd_limit_percent": dd_limit_percent,
+        "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
+        "created_at": now_iso(),
+    }
+    safe_insert("monitoring_events", event)
+    try:
+        snap = dict(event)
+        snap["zone"] = zone
+        snap["created_at"] = now_iso()
+        safe_insert("monitoring_snapshots", snap)
+    except Exception:
+        pass
+
+    if breached:
+        alert_once(
+            account, "breached", "ACCOUNT BREACHED",
+            f"MT5 {account.get('mt5_login')} hit/below its static {dd_limit_percent:g}% DD level {breach_level:,.2f}.",
+            "critical", event
+        )
+    elif target_hit:
+        next_label = "Funded" if (stage == "phase1" and rules.get("one_phase")) else "next-stage"
+        alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting {next_label} MT5 assignment.", "success", event)
+    elif current_dd >= dd_limit_percent * 0.50:
+        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}% of a {dd_limit_percent:g}% limit.", "warning", event)
+
+    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used, "account_write_ok": account_write_ok, "account_write_mode": account_write_mode, "trader_write_ok": trader_write_ok, "persisted_account_status": (persisted_account or {}).get("account_status"), "persisted_balance": (persisted_account or {}).get("current_balance"), "persisted_equity": (persisted_account or {}).get("current_equity")}
+
+
+@app.route("/")
+def home():
+    return ok({"service": "NairaPips Monitoring API", "status": "live"})
+
+
+def _parse_iso_ts(v):
+    if not v:
+        return None
+    try:
+        s = str(v).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _monitoring_freshness_payload(stale_after_seconds=180):
+    now = datetime.now(timezone.utc)
+    # Best-effort maintenance: old terminal rows stay in history but leave live monitoring.
+    retire_old_terminal_accounts()
+    rows = (
+        supabase.table("trader_accounts")
+        .select("id,trader_id,mt5_login,stage,account_status,last_sync_at,updated_at,current_balance,current_equity")
+        .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+        .limit(MONITORABLE_LIMIT)
+        .execute()
+        .data
+        or []
+    )
+    active = []
+    stale = []
+    never = []
+    newest = None
+    for r in rows:
+        if not str(r.get("mt5_server") or "").strip():
+            # Some schemas/queries may not include server in this lightweight health query.
+            pass
+        ts = _parse_iso_ts(r.get("last_sync_at"))
+        age = None
+        if ts:
+            age = max(0, int((now - ts).total_seconds()))
+            if newest is None or ts > newest:
+                newest = ts
+        item = {
+            "trader_account_id": r.get("id"),
+            "trader_id": r.get("trader_id"),
+            "mt5_login": r.get("mt5_login"),
+            "stage": r.get("stage"),
+            "account_status": r.get("account_status"),
+            "last_sync_at": r.get("last_sync_at"),
+            "sync_age_seconds": age,
+            "current_balance": r.get("current_balance"),
+            "current_equity": r.get("current_equity"),
+        }
+        active.append(item)
+        if not ts:
+            never.append(item)
+        elif age is not None and age > stale_after_seconds:
+            stale.append(item)
+
+    newest_age = None
+    if newest:
+        newest_age = max(0, int((now - newest).total_seconds()))
+
+    if not active:
+        state = "no_active_accounts"
+    elif newest is None:
+        state = "engine_not_seen"
+    elif newest_age is not None and newest_age > stale_after_seconds:
+        state = "engine_stale"
+    elif stale:
+        state = "partial_stale"
+    else:
+        state = "live"
+
+    return {
+        "health": "ok" if state in {"live", "partial_stale"} else "warning",
+        "service": "monitoring",
+        "release": NAIRAPIPS_MONITORING_RELEASE,
+        "monitoring_state": state,
+        "server_time": now_iso(),
+        "active_accounts": len(active),
+        "stale_accounts": len(stale),
+        "never_synced_accounts": len(never),
+        "newest_snapshot_at": newest.isoformat() if newest else None,
+        "newest_snapshot_age_seconds": newest_age,
+        "stale_after_seconds": stale_after_seconds,
+        "stale_sample": stale[:20],
+        "never_synced_sample": never[:20],
+    }
+
+@app.route("/health")
+def health():
+    try:
+        return ok(_monitoring_freshness_payload())
+    except Exception as e:
+        return bad({"health": "warning", "service": "monitoring", "error": str(e), "time": now_iso()}, 500)
+
+@app.route("/monitoring_health")
+def monitoring_health():
+    """Management diagnostic endpoint.
+
+    This does not invent MT5 data. It tells management whether fresh snapshots
+    are actually reaching the Monitoring API and which active accounts are stale.
+    """
+    try:
+        seconds = request.args.get("stale_after_seconds", "180")
+        try:
+            seconds = max(60, min(int(seconds), 86400))
+        except Exception:
+            seconds = 180
+        return ok(_monitoring_freshness_payload(seconds))
+    except Exception as e:
+        return bad(e, 500)
+
+
+@app.route("/admin_recall_wrong_assignment", methods=["POST", "OPTIONS"])
+def admin_recall_wrong_assignment():
+    """Recall one unused mistaken assignment while preserving the real active account."""
+    if request.method == "OPTIONS":
+        return ok({})
+    _admin, auth_error = require_main_api_admin()
+    if auth_error:
+        return auth_error
+
+    data = request.get_json(silent=True) or {}
+    trader_id = str(data.get("trader_id") or "").strip()
+    account_id = str(data.get("trader_account_id") or "").strip()
+    note = str(data.get("admin_note") or "Assigned to wrong trader").strip()
+    if not trader_id or not account_id:
+        return bad("trader_id and exact trader_account_id are required", 400)
+
+    try:
+        account_rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        if not account_rows:
+            return bad("Selected account was not found", 404)
+        account = account_rows[0]
+        if str(account.get("trader_id") or "") != trader_id:
+            return bad("Selected account does not belong to this trader", 409)
+        status_before = str(account.get("account_status") or "").strip().lower()
+        if status_before not in ACTIVE_ACCOUNT_STATUSES:
+            if status_before == "archived" and str(account.get("archive_reason") or "") == "wrong_assignment_recalled":
+                return ok({"idempotent": True}, "Wrong assignment was already recalled")
+            return bad("Only an active account can be recalled", 409)
+
+        trades = supabase.table("trader_trades").select("id").eq("trader_account_id", account_id).limit(1).execute().data or []
+        start = num(account.get("start_balance") or account.get("account_size"))
+        balance = num(account.get("current_balance"), start)
+        equity = num(account.get("current_equity"), balance)
+        activity = [
+            num(account.get("profit") or account.get("current_profit")),
+            num(account.get("profit_percent") or account.get("current_profit_percent")),
+            num(account.get("dd_used_percent")), num(account.get("absolute_drawdown_percent")),
+            num(account.get("worst_dd_used_percent")), num(account.get("worst_static_drawdown_percent")),
+        ]
+        tolerance = max(0.01, abs(start) * 0.000001)
+        if trades or any(abs(value) > 0.000001 for value in activity) or abs(balance - start) > tolerance or abs(equity - start) > tolerance:
+            return bad("Recall blocked: this account has trading or balance activity. Use Reset Account instead.", 409)
+
+        remaining = (
+            supabase.table("trader_accounts").select("*").eq("trader_id", trader_id)
+            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).limit(100).execute().data or []
+        )
+        remaining = [row for row in remaining if str(row.get("id") or "") != account_id]
+        if not remaining:
+            return bad("Recall blocked: no genuine active account remains for this trader. Use Reset Account if a replacement is required.", 409)
+        genuine = remaining[0]
+
+        purchase_id = str(account.get("purchase_id") or "").strip()
+        if purchase_id:
+            purchase_rows = supabase.table("challenge_purchases").select("id,trader_id,trader_account_id").eq("id", purchase_id).limit(1).execute().data or []
+            if not purchase_rows:
+                return bad("Linked purchase was not found; recall cancelled before any change", 409)
+            if str(purchase_rows[0].get("trader_id") or trader_id) != trader_id:
+                return bad("Linked purchase belongs to another trader", 409)
+
+        now = now_iso()
+        reason = "wrong_assignment_recalled"
+        evidence = f"Wrong assignment recalled. {note} | trader_account_id={account_id} | MT5={account.get('mt5_login') or ''}"
+
+        account_ok, _removed, account_error = _np_adaptive_table_update("trader_accounts", "id", account_id, {
+            "account_status": "archived", "risk_zone": "archived", "archive_reason": reason,
+            "archived_at": now, "breach_reason": None, "breached_at": None,
+            "monitoring_enabled": False, "updated_at": now,
+        })
+        if not account_ok:
+            return bad(f"Recall failed while archiving the selected account: {account_error}", 500)
+
+        if purchase_id:
+            purchase_ok, _removed, purchase_error = _np_adaptive_table_update("challenge_purchases", "id", purchase_id, {
+                "status": "archived", "lifecycle_state": "archived", "account_state": "archived",
+                "trader_account_id": None, "assigned_mt5_id": None, "mt5_login": "", "mt5_server": "",
+                "mt5_master_password": "", "mt5_password": "", "master_password": "",
+                "mt5_investor_password": "", "investor_password": "", "archive_reason": reason,
+                "archived_at": now, "admin_note": evidence + " | no replacement required", "updated_at": now,
+            })
+            if not purchase_ok:
+                return bad(f"Account archived but linked purchase reconciliation failed: {purchase_error}", 500)
+
+        pool_id = str(account.get("mt5_pool_id") or "").strip()
+        if pool_id:
+            pool_ok, _removed, pool_error = _np_adaptive_table_update("mt5_pool", "id", pool_id, {
+                "status": "recalled_hold", "assigned_trader_id": None, "assigned_trader_name": None,
+                "assigned_email": None, "trader_account_id": None, "archived_at": now,
+                "archive_reason": reason, "admin_note": evidence + " | ROTATE BOTH PASSWORDS BEFORE REUSE", "updated_at": now,
+            })
+            if not pool_ok:
+                return bad(f"Account recalled but MT5 security hold failed: {pool_error}", 500)
+
+        genuine_stage = str(genuine.get("stage") or "phase1").strip().lower()
+        trader_payload = {
+            "current_account_id": genuine.get("id"),
+            "challenge_state": "funded_active" if genuine_stage == "funded" else f"{genuine_stage}_active",
+            "status": "active", "phase": genuine_stage, "mt5_login": genuine.get("mt5_login") or "",
+            "mt5_server": genuine.get("mt5_server") or "", "mt5_master_password": genuine.get("mt5_master_password") or "",
+            "mt5_password": genuine.get("mt5_master_password") or "", "master_password": genuine.get("mt5_master_password") or "",
+            "mt5_investor_password": genuine.get("mt5_investor_password") or "", "investor_password": genuine.get("mt5_investor_password") or "",
+            "monitoring_enabled": bool(genuine.get("monitoring_enabled", True)), "mt5_account_active": True,
+            "mt5_access_disabled": False, "mt5_reset_reason": None, "admin_note": evidence,
+            "lifecycle_updated_at": now, "updated_at": now,
+        }
+        if not verified_trader_update(trader_id, trader_payload):
+            return bad("Recall completed but trader current-account reconciliation failed", 500)
+
+        safe_insert("lifecycle_events", {
+            "trader_id": trader_id, "trader_account_id": account_id, "from_state": status_before,
+            "to_state": "archived", "action": "admin_recall_wrong_assignment", "details": evidence,
+            "created_by": str(data.get("admin_username") or data.get("admin_name") or "admin"), "created_at": now,
+        })
+        safe_insert("monitoring_events", {
+            "trader_id": trader_id, "trader_account_id": account_id, "mt5_login": account.get("mt5_login"),
+            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived", "message": evidence, "created_at": now,
+        })
+        return ok({
+            "recalled_account_id": account_id, "recalled_mt5_login": account.get("mt5_login"),
+            "current_account_id": genuine.get("id"), "current_mt5_login": genuine.get("mt5_login"),
+            "pool_status": "recalled_hold",
+        }, "Wrong assignment recalled. Genuine account preserved. Rotate both MT5 passwords before reuse.")
+    except Exception as exc:
+        print("ADMIN RECALL ERROR:", str(exc), flush=True)
+        return bad(exc, 500)
+
+
+
+def _bulk_rows(table_name, ids, select="*"):
+    """One bounded Supabase query for a set of IDs. Never N+1 inside discovery."""
+    clean_ids = [str(x).strip() for x in (ids or []) if str(x or "").strip()]
+    if not clean_ids:
+        return {}
+    # preserve order while deduplicating
+    clean_ids = list(dict.fromkeys(clean_ids))
+    try:
+        rows = (
+            supabase.table(table_name)
+            .select(select)
+            .in_("id", clean_ids)
+            .execute()
+            .data
+            or []
+        )
+        return {str(r.get("id")): r for r in rows if r.get("id")}
+    except Exception as e:
+        print(f"FAST DISCOVERY BULK FETCH ERROR table={table_name}: {e}", flush=True)
+        return {}
+
+
+def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
+    """Exact account safety checks without writes, alerts or per-row DB queries.
+
+    Discovery must stay read-only and fast. Lifecycle disagreements are handled by
+    lifecycle/event processing elsewhere; they must never make Gunicorn time out.
+    """
+    if not is_active_monitoring_account(account):
+        return False, "account is not monitorable"
+    if not str((account or {}).get("mt5_server") or "").strip():
+        return False, "account has no mt5_server"
+    if bool_false((account or {}).get("monitoring_enabled")):
+        return False, "account monitoring_enabled is false"
+    if bool_true((account or {}).get("mt5_access_disabled")):
+        return False, "account mt5_access_disabled is true"
+    if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
+        return False, "account is superseded"
+
+    purchase_id = str((account or {}).get("purchase_id") or "").strip()
+    if purchase_id:
+        ok_purchase, reason = is_active_purchase_for_account(purchase or {}, account)
+        if not ok_purchase:
+            return False, reason
+
+    ok_pool, reason = is_active_pool_for_account(mt5_pool or {}, account)
+    if not ok_pool:
+        return False, reason
+
+    return True, "eligible"
+
+
+def _fast_rule_values(account, purchase=None, plan=None):
+    """Resolve exact monitoring rules without guessed commercial fallbacks."""
+    account = account or {}
+    purchase = purchase or {}
+    plan = plan or {}
+    stage = str(account.get("stage") or account.get("phase") or "phase1").strip().lower()
+
+    def first_num(*values):
+        for v in values:
+            if v not in (None, ""):
+                n = num(v, None)
+                if n is not None and n > 0:
+                    return float(n)
+        return None
+
+    dd_limit = first_num(
+        account.get("dd_limit_percent"),
+        account.get("max_drawdown"),
+        account.get("max_drawdown_percent"),
+        purchase.get("dd_limit_percent"),
+        purchase.get("max_drawdown"),
+        purchase.get("max_drawdown_percent"),
+        plan.get("dd_limit_percent"),
+        plan.get("max_drawdown"),
+        plan.get("max_drawdown_percent"),
+        plan.get("total_dd"),
+    )
+
+    if stage == "phase1":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            account.get("phase1_target"),
+            purchase.get("target_percent"),
+            purchase.get("phase1_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
+            plan.get("phase1_target"),
+            plan.get("profit_target"),
+        )
+    elif stage == "phase2":
+        target = first_num(
+            account.get("target_percent"),
+            account.get("profit_target"),
+            account.get("phase2_target"),
+            purchase.get("target_percent"),
+            purchase.get("phase2_target"),
+            purchase.get("profit_target"),
+            plan.get("target_percent"),
+            plan.get("phase2_target"),
+            plan.get("profit_target"),
+        )
+    else:
+        target = 0.0
+
+    def source_for(value, candidates):
+        if value is None:
+            return "authority_missing"
+        for label, raw in candidates:
+            try:
+                if raw not in (None, "") and float(raw) > 0 and abs(float(raw) - float(value)) < 1e-9:
+                    return label
+            except Exception:
+                pass
+        return "resolved_exact"
+
+    dd_source = source_for(dd_limit, [
+        ("account.dd_limit_percent", account.get("dd_limit_percent")),
+        ("account.max_drawdown", account.get("max_drawdown")),
+        ("purchase.dd_limit_percent", purchase.get("dd_limit_percent")),
+        ("purchase.max_drawdown", purchase.get("max_drawdown")),
+        ("plan.dd_limit_percent", plan.get("dd_limit_percent")),
+        ("plan.max_drawdown", plan.get("max_drawdown")),
+    ])
+    target_source = source_for(target, [
+        ("account.target_percent", account.get("target_percent")),
+        ("account.profit_target", account.get("profit_target")),
+        (f"account.{stage}_target", account.get("phase1_target") if stage == "phase1" else account.get("phase2_target")),
+        ("purchase.target_percent", purchase.get("target_percent")),
+        (f"purchase.{stage}_target", purchase.get("phase1_target") if stage == "phase1" else purchase.get("phase2_target")),
+        ("plan.target_percent", plan.get("target_percent")),
+        (f"plan.{stage}_target", plan.get("phase1_target") if stage == "phase1" else plan.get("phase2_target")),
+    ])
+
+    return {
+        "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "dd_authority_present": bool(dd_limit is not None),
+        "dd_authority_source": dd_source,
+        "target_percent": float(target) if target is not None else 0.0,
+        "target_authority_present": bool(stage not in {"phase1", "phase2"} or target is not None),
+        "target_authority_source": target_source,
+    }
+
+
+TERMINAL_RETIRE_STATUSES = {
+    "archived", "archived_phase1", "archived_phase2", "archived_funded",
+    "archived_reset", "archived_reset_phase1", "archived_reset_phase2", "archived_reset_funded",
+    "breached", "breached_archived", "passed", "closed", "disabled", "locked",
+    "disqualified"
+}
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+def _terminal_retirement_reference_time(account):
+    for key in ("archived_at", "breached_at", "passed_at", "reset_at", "updated_at", "created_at", "started_at"):
+        dt = _parse_iso_dt((account or {}).get(key))
+        if dt is not None:
+            return dt
+    return None
+
+def _should_retire_terminal_account(account, now=None):
+    from datetime import datetime, timezone, timedelta
+    now = now or datetime.now(timezone.utc)
+    status = str((account or {}).get("account_status") or (account or {}).get("status") or "").strip().lower()
+    is_terminal = status in TERMINAL_RETIRE_STATUSES or status.startswith("archived_reset")
+    if not is_terminal:
+        return False, "not_terminal"
+    ref = _terminal_retirement_reference_time(account)
+    if ref is None:
+        return False, "missing_terminal_timestamp"
+    if ref > now - timedelta(days=max(1, TERMINAL_RETIRE_AFTER_DAYS)):
+        return False, "within_retention_window"
+    return True, f"terminal_{TERMINAL_RETIRE_AFTER_DAYS}d_plus"
+
+def retire_old_terminal_accounts():
+    """Best-effort retirement: keep history, stop MT5 monitoring. No deletes."""
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("id,account_status,status,monitoring_enabled,archived_at,breached_at,passed_at,reset_at,updated_at,created_at,started_at")
+            .limit(MONITORABLE_LIMIT)
+            .execute().data or []
+        )
+        retired = 0
+        for row in rows:
+            should, reason = _should_retire_terminal_account(row)
+            if not should:
+                continue
+            if bool_false(row.get("monitoring_enabled")):
+                continue
+            safe_update("trader_accounts", {
+                "monitoring_enabled": False,
+                "updated_at": now_iso(),
+            }, "id", row.get("id"))
+            retired += 1
+        if retired:
+            print(f"TERMINAL RETIREMENT: retired {retired} old terminal account(s) from MT5 monitoring", flush=True)
+        return retired
+    except Exception as e:
+        print("TERMINAL RETIREMENT ERROR:", e, flush=True)
+        return 0
+
+def _fast_monitorable_feed():
+    """Production-critical MT5 discovery path.
+
+    Maximum normal DB work:
+      1 trader_accounts query
+      1 challenge_purchases bulk query
+      1 mt5_pool bulk query
+      1 traders bulk query
+      1 challenge_plans bulk query
+
+    No per-account queries. No monitoring_events writes. No lifecycle reconciliation.
+    """
+    rows = (
+        supabase.table("trader_accounts")
+        .select("*")
+        .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+        .limit(MONITORABLE_LIMIT)
+        .execute()
+        .data
+        or []
+    )
+
+    # Cheapest account-level safety first.
+    base = []
+    for a in rows:
+        if not is_active_monitoring_account(a):
+            continue
+        if not str(a.get("mt5_server") or "").strip():
+            continue
+        if bool_false(a.get("monitoring_enabled")) or bool_true(a.get("mt5_access_disabled")):
+            continue
+        if a.get("superseded_at") or a.get("replaced_at") or bool_true(a.get("superseded")):
+            continue
+        base.append(a)
+
+    purchase_map = _bulk_rows("challenge_purchases", [a.get("purchase_id") for a in base])
+    pool_map = _bulk_rows("mt5_pool", [a.get("mt5_pool_id") for a in base])
+
+    eligible = []
+    excluded = []
+    for a in base:
+        purchase = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        pool = pool_map.get(str(a.get("mt5_pool_id") or "")) or {}
+        ok, reason = _quiet_monitoring_eligibility(a, purchase, pool)
+        if ok:
+            eligible.append(a)
+        else:
+            excluded.append((a, reason))
+
+    # Exact-login ambiguity remains a hard safety exclusion, but logging is console-only.
+    by_login = {}
+    for a in eligible:
+        by_login.setdefault(clean_login(a.get("mt5_login")), []).append(a)
+
+    clean = []
+    ambiguous = 0
+    for login, group in by_login.items():
+        if login and len(group) == 1:
+            clean.append(group[0])
+        else:
+            ambiguous += len(group)
+            print(
+                "FAST DISCOVERY EXCLUDED AMBIGUOUS LOGIN:",
+                {"mt5_login": login, "account_ids": [r.get("id") for r in group]},
+                flush=True,
+            )
+
+    trader_map = _bulk_rows("traders", [a.get("trader_id") for a in clean])
+
+    # Plan lookup is also bulk and only used as fallback when account/purchase does not
+    # already carry frozen commercial rules.
+    plan_ids = []
+    for a in clean:
+        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
+        if plan_id:
+            plan_ids.append(plan_id)
+    plan_map = _bulk_rows("challenge_plans", plan_ids)
+
+    out = []
+    for a in clean:
+        t = trader_map.get(str(a.get("trader_id") or "")) or {}
+        p = purchase_map.get(str(a.get("purchase_id") or "")) or {}
+        plan_id = a.get("plan_id") or p.get("plan_id") or p.get("challenge_plan_id")
+        plan = plan_map.get(str(plan_id or "")) or {}
+        rule_values = _fast_rule_values(a, p, plan)
+        dd_limit = rule_values["dd_limit_percent"]
+        target = rule_values["target_percent"]
+
+        out.append({
+            "id": a.get("id"),
+            "trader_id": a.get("trader_id"),
+            "trader_account_id": a.get("id"),
+            "current_account_id": a.get("id"),
+            "name": t.get("name") or t.get("trader_name") or "Trader",
+            "full_name": t.get("full_name") or t.get("name") or t.get("trader_name") or "Trader",
+            "email": t.get("email") or a.get("email"),
+            "phone": t.get("phone") or "",
+            "phase": a.get("stage") or t.get("phase") or "phase1",
+            "stage": a.get("stage") or t.get("phase") or "phase1",
+            "status": "active",
+            "account_status": a.get("account_status") or "assigned_active",
+            "payment_status": "approved",
+            "monitoring_enabled": True,
+            "mt5_access_disabled": False,
+            "mt5_login": clean_login(a.get("mt5_login")),
+            "mt5_server": a.get("mt5_server") or "",
+            "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "mt5_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
+            "mt5_investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+            "investor_password": a.get("mt5_investor_password") or a.get("investor_password") or "",
+            "account_size": num(a.get("account_size") or a.get("start_balance")),
+            "dd_limit_percent": dd_limit,
+            "dd_authority_present": rule_values["dd_authority_present"],
+            "dd_authority_source": rule_values.get("dd_authority_source") or "authority_missing",
+            "target_percent": target,
+            "target_authority_present": rule_values["target_authority_present"],
+            "target_authority_source": rule_values.get("target_authority_source") or "authority_missing",
+            "balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "current_balance": num(a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "current_equity": num(a.get("current_equity") or a.get("current_balance") or a.get("start_balance") or a.get("account_size")),
+            "highest_equity": num(a.get("highest_equity") or a.get("current_equity") or a.get("start_balance") or a.get("account_size")),
+            "lowest_equity": num(a.get("lowest_equity") or a.get("start_balance") or a.get("account_size")),
+            "profit_percent": num(a.get("profit_percent")),
+            "risk_zone": a.get("risk_zone") or "safe",
+            "_source_of_truth": "monitoring_api_fast_discovery",
+        })
+
+    print(
+        "FAST DISCOVERY COMPLETE:",
+        {
+            "active_rows": len(rows),
+            "base_eligible": len(base),
+            "monitorable": len(out),
+            "excluded": len(excluded),
+            "ambiguous": ambiguous,
+        },
+        flush=True,
+    )
+    return out
+
+
+@app.route("/monitorable_accounts")
+def monitorable_accounts():
+    """Fast, read-only discovery endpoint for the Windows MT5 engine."""
+    try:
+        out = _fast_monitorable_feed()
+        return ok(out, f"{len(out)} monitorable account(s)")
+    except Exception as e:
+        print("FAST DISCOVERY FATAL ERROR:", repr(e), flush=True)
+        return bad(e, 500)
+
+
+@app.route("/monitoring_snapshot", methods=["POST", "OPTIONS"])
+def monitoring_snapshot():
+    if request.method == "OPTIONS":
+        return ok({})
+    data = request.get_json(silent=True) or {}
+    account_id = data.get("trader_account_id") or data.get("current_account_id")
+    if not account_id:
+        return bad("Exact trader_account_id is required for snapshot", 400)
+    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
+    if not account:
+        return bad("Active account not found or ownership evidence mismatched", 404)
+    result = apply_intelligence(account, data)
+    print(f"GLOBAL_FEED SNAPSHOT APPLIED mt5={data.get('mt5_login')} result={result}", flush=True)
+    if not isinstance(result, dict) or not result.get("account_write_ok"):
+        return bad(f"Snapshot persistence failed for MT5 {data.get('mt5_login')}: {result}", 500)
+    if result.get("breached") and str(result.get("persisted_account_status") or "").lower() != "breached_archived":
+        return bad(f"Breach persistence verification failed for MT5 {data.get('mt5_login')}: status={result.get('persisted_account_status')}", 500)
+    return ok(result, "snapshot applied and verified")
+
+
+@app.route("/disable_mt5_access", methods=["POST", "OPTIONS"])
+def disable_mt5_access():
+    if request.method == "OPTIONS":
+        return ok({})
+    data = request.get_json(silent=True) or {}
+    account_id = data.get("trader_account_id") or data.get("current_account_id")
+    if not account_id:
+        return bad("Exact trader_account_id is required", 400)
+    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
+    if not account:
+        return bad("Active account not found or ownership evidence mismatched", 404)
+    status = str(data.get("status") or "breached").lower()
+    reason = data.get("reason") or "MT5 access disabled by monitoring engine"
+    payload = {
+        "account_status": "breached_archived" if "breach" in status else status,
+        "monitoring_enabled": False,
+        "risk_zone": "breached" if "breach" in status else status,
+        "archive_reason": reason,
+        "archived_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    # Redundant final-evidence persistence: if /monitoring_snapshot failed because an
+    # optional schema column rejected the full payload, the lock endpoint still saves
+    # the real broker numbers with the terminal state.
+    evidence_map = {
+        "current_balance": data.get("current_balance") if data.get("current_balance") not in (None, "") else data.get("mt5_balance"),
+        "current_equity": data.get("equity"),
+        "profit": data.get("profit"),
+        "profit_percent": data.get("profit_percent"),
+        "highest_equity": data.get("highest_equity"),
+        "lowest_equity": data.get("lowest_equity"),
+        "absolute_drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
+        "drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
+        "dd_used_percent": data.get("dd_used_percent"),
+        "phase_pass_status": "" if "breach" in status else data.get("phase_pass_status"),
+        "breached_at": now_iso() if "breach" in status else account.get("breached_at"),
+        "breach_reason": reason if "breach" in status else account.get("breach_reason"),
+    }
+    for k, v in evidence_map.items():
+        if v not in (None, ""):
+            payload[k] = v
+
+    account_write_ok, persisted, write_mode = verified_account_update(account.get("id"), payload)
+    trader_write_ok = verified_trader_update(account.get("trader_id"), {"status": "breached" if "breach" in status else status, "challenge_state": status, "mt5_access_disabled": True, "monitoring_enabled": False, "updated_at": now_iso()})
+    safe_insert("monitoring_events", {"trader_id": account.get("trader_id"), "trader_account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "event_type": status, "risk_zone": "breached" if "breach" in status else status, "message": reason, "balance": payload.get("current_balance"), "equity": payload.get("current_equity"), "drawdown_percent": payload.get("drawdown_percent"), "dd_used_percent": payload.get("dd_used_percent"), "created_at": now_iso()})
+    alert_once(account, status, status.upper(), reason, "critical", data)
+    expected_status = "breached_archived" if "breach" in status else status
+    persisted_status = str((persisted or {}).get("account_status") or "").lower()
+    if not account_write_ok or persisted_status != str(expected_status).lower():
+        return bad(f"MT5 lock persistence failed: account_write_ok={account_write_ok}, mode={write_mode}, persisted_status={persisted_status}, expected={expected_status}", 500)
+    return ok({"account_id": account.get("id"), "status": status, "persisted_account_status": persisted_status, "persisted_balance": (persisted or {}).get("current_balance"), "persisted_equity": (persisted or {}).get("current_equity"), "account_write_mode": write_mode, "trader_write_ok": trader_write_ok}, "access disabled and verified")
+
+
+@app.route("/sync_trades", methods=["POST", "OPTIONS"])
+def sync_trades():
+    if request.method == "OPTIONS":
+        return ok({})
+    data = request.get_json(silent=True) or {}
+    trades = data.get("trades") or []
+    if not isinstance(trades, list):
+        return bad("trades must be a list")
+    saved = 0
+    skipped = 0
+    account_cache = {}
+    for trade in trades[:500]:
+        if not isinstance(trade, dict):
+            continue
+        row = dict(trade)
+        lookup_id = row.get("trader_account_id") or row.get("current_account_id") or data.get("trader_account_id") or data.get("current_account_id")
+        lookup_login = row.get("mt5_login") or data.get("mt5_login")
+        if not lookup_id:
+            skipped += 1
+            print("TRADE SYNC SKIPPED WITHOUT EXACT ACCOUNT ID:", {"mt5_login": clean_login(lookup_login)}, flush=True)
+            continue
+        cache_key = f"{lookup_id or ''}:{clean_login(lookup_login)}"
+        account = account_cache.get(cache_key)
+        if cache_key not in account_cache:
+            account = get_account_by_id_or_login(lookup_id, lookup_login)
+            account_cache[cache_key] = account
+        if not account:
+            skipped += 1
+            print("TRADE SYNC SKIPPED NON-ACTIVE ACCOUNT:", {"trader_account_id": lookup_id, "mt5_login": clean_login(lookup_login)}, flush=True)
+            continue
+        row["trader_id"] = account.get("trader_id")
+        row["trader_account_id"] = account.get("id")
+        row["mt5_login"] = clean_login(account.get("mt5_login"))
+        row["synced_at"] = now_iso()
+        row["updated_at"] = now_iso()
+        if not row.get("created_at"):
+            row["created_at"] = now_iso()
+        # Keep this fast. Upsert if DB has a suitable unique key, otherwise insert fallback.
+        try:
+            supabase.table("trader_trades").upsert(row, on_conflict="ticket,mt5_login").execute()
+        except Exception:
+            try:
+                supabase.table("trader_trades").insert(row).execute()
+            except Exception as e:
+                print("TRADE SAVE SKIPPED:", e)
+                continue
+        saved += 1
+    return ok({"received": len(trades), "saved": saved, "skipped_non_active": skipped}, "trades synced")
+
+
+@app.route("/traders")
+def traders_compat():
+    """Compatibility alias: old engines may still call /traders.
+    It returns the same clean account-level feed as /monitorable_accounts, not legacy trader rows.
+    """
+    return monitorable_accounts()
+
+
+@app.route("/traders_raw")
+def traders_raw_compat():
+    return monitorable_accounts()
+
+
+@app.route("/debug/supabase")
+def debug_supabase_compat():
+    return monitorable_accounts()
+
+
+@app.route("/trader_current_account/<path:lookup>")
+def trader_current_account_compat(lookup):
+    """Lightweight global-feed account lookup so no call falls back to stale legacy MT5 data."""
+    lookup = str(lookup or "").strip()
+    try:
+        trader = None
+        accounts = []
+        if "@" in lookup:
+            trs = supabase.table("traders").select("*").eq("email", lookup).order("updated_at", desc=True).limit(1).execute().data or []
+            trader = trs[0] if trs else None
+            if trader:
+                accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).limit(50).execute().data or []
+        elif lookup.isdigit():
+            accounts = supabase.table("trader_accounts").select("*").eq("mt5_login", lookup).order("updated_at", desc=True).limit(50).execute().data or []
+        else:
+            trs = supabase.table("traders").select("*").eq("id", lookup).limit(1).execute().data or []
+            trader = trs[0] if trs else None
+            if trader:
+                accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).limit(50).execute().data or []
+        caches = {}
+        if trader and trader.get("id"):
+            caches.setdefault("traders", {})[str(trader.get("id"))] = trader
+        active_accounts = [a for a in accounts if account_is_eligible(a, caches)[0]]
+        current = None
+        if lookup.isdigit():
+            if len(active_accounts) == 1:
+                current = active_accounts[0]
+                trader_id = current.get("trader_id")
+                if trader_id:
+                    trs = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+                    trader = trs[0] if trs else None
+            elif len(active_accounts) > 1:
+                trader = None
+                for row in active_accounts:
+                    log_lifecycle_inconsistency(
+                        "mt5_login resolves to multiple eligible active accounts; exact trader_account_id required",
+                        row,
+                        caches.get("purchases", {}).get(str(row.get("purchase_id") or "").strip()) or {},
+                        caches.get("pools", {}).get(str(row.get("mt5_pool_id") or "").strip()) or {},
+                        caches.get("traders", {}).get(str(row.get("trader_id") or "").strip()) or {},
+                    )
+            # Never guess between duplicate eligible rows for a login-only lookup.
+        else:
+            current = active_accounts[0] if active_accounts else None
+        return ok({"source_of_truth": "trader_accounts", "trader": trader or {}, "current_account": current, "active_accounts": active_accounts, "accounts": accounts}, "global feed account loaded")
+    except Exception as e:
+        return bad(e, 500)
+
+
+@app.route("/account_intelligence_scan")
+def account_intelligence_scan():
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+            .limit(MONITORABLE_LIMIT)
+            .execute()
+            .data
+            or []
+        )
+        rows = eligible_accounts_without_login_ambiguity(rows, "account_intelligence_scan")
+        results = []
+        for account in rows:
+            snapshot = {
+                "trader_account_id": account.get("id"),
+                "mt5_login": account.get("mt5_login"),
+                "equity": account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
+                "highest_equity": account.get("highest_equity") or account.get("current_equity") or account.get("start_balance") or account.get("account_size"),
+                "lowest_equity": account.get("lowest_equity") or account.get("start_balance") or account.get("account_size"),
+                "timestamp": now_iso(),
             }
-            clean_rows.append(row)
-
-        supabase.table('payment_accounts').delete().neq('id', -1).execute()
-        if clean_rows:
-            supabase.table('payment_accounts').insert(clean_rows).execute()
-
-        return jsonify({'success': True, 'data': clean_rows})
+            results.append(apply_intelligence(account, snapshot))
+        return ok(results, f"scanned {len(results)} active account(s)")
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-@app.route("/test_email")
-def test_email():
+        return bad(e, 500)
+
+
+
+@app.route("/rule_authority_health", methods=["GET"])
+def rule_authority_health():
+    """Read-only production gate: challenge accounts must have exact target + DD authority."""
     try:
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_EMAIL
-        msg["To"] = SMTP_EMAIL
-        msg["Subject"] = "NairaPips Email Test"
+        items = _fast_monitorable_feed()
+        unresolved = []
+        for row in items:
+            stage = str(row.get("stage") or row.get("phase") or "").lower()
+            if stage not in {"phase1", "phase2"}:
+                continue
+            missing = []
+            if not row.get("target_authority_present"):
+                missing.append("target")
+            if not row.get("dd_authority_present"):
+                missing.append("dd")
+            if missing:
+                unresolved.append({
+                    "trader_account_id": row.get("trader_account_id") or row.get("id"),
+                    "mt5_login": row.get("mt5_login"),
+                    "stage": stage,
+                    "missing": missing,
+                    "target_percent": row.get("target_percent"),
+                    "target_source": row.get("target_authority_source"),
+                    "dd_limit_percent": row.get("dd_limit_percent"),
+                    "dd_source": row.get("dd_authority_source"),
+                })
+        if unresolved:
+            print("CRITICAL RULE AUTHORITY UNRESOLVED:", unresolved, flush=True)
+        return jsonify({
+            "success": True,
+            "healthy": len(unresolved) == 0,
+            "monitorable_count": len(items),
+            "unresolved_count": len(unresolved),
+            "unresolved": unresolved,
+            "release": "PAYING_CUSTOMER_TARGET_DD_HARDENED_2026_09_02",
+        })
+    except Exception as exc:
+        return jsonify({"success": False, "healthy": False, "error": str(exc)}), 500
 
-        body = """
-NairaPips email system is working.
-
-This confirms support@nairapips.com can send automated emails from Render.
-
-NairaPips Team
-"""
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
-        server.quit()
-
-        return {"success": True, "message": "Test email sent"}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 if __name__ == "__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
