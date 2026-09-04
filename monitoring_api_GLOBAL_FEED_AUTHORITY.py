@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "EXACT_PLAN_RULE_AUTHORITY_10_15_TARGET_DD_2026_09_02"
+NAIRAPIPS_MONITORING_RELEASE = "SAFE_WRONG_ASSIGNMENT_RECALL_NO_REPLACEMENT_2026_09_04"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -1154,9 +1154,16 @@ def admin_recall_wrong_assignment():
             .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).limit(100).execute().data or []
         )
         remaining = [row for row in remaining if str(row.get("id") or "") != account_id]
-        if not remaining:
-            return bad("Recall blocked: no genuine active account remains for this trader. Use Reset Account if a replacement is required.", 409)
-        genuine = remaining[0]
+
+        # WRONG-ASSIGNMENT AUTHORITY:
+        # Recall corrects mistaken ownership; it is not a reset/replacement flow.
+        # All safety checks above still require the exact MT5 to be unused:
+        # no trades, no profit/DD activity, and balance/equity unchanged from start.
+        #
+        # If another genuine active account exists, preserve/repoint the trader to it.
+        # If none exists, clear the mistaken MT5 mirror and keep the trader identity/login.
+        # Never create Second Life or an automatic replacement from Recall.
+        genuine = remaining[0] if remaining else None
 
         purchase_id = str(account.get("purchase_id") or "").strip()
         if purchase_id:
@@ -1199,18 +1206,53 @@ def admin_recall_wrong_assignment():
             if not pool_ok:
                 return bad(f"Account recalled but MT5 security hold failed: {pool_error}", 500)
 
-        genuine_stage = str(genuine.get("stage") or "phase1").strip().lower()
-        trader_payload = {
-            "current_account_id": genuine.get("id"),
-            "challenge_state": "funded_active" if genuine_stage == "funded" else f"{genuine_stage}_active",
-            "status": "active", "phase": genuine_stage, "mt5_login": genuine.get("mt5_login") or "",
-            "mt5_server": genuine.get("mt5_server") or "", "mt5_master_password": genuine.get("mt5_master_password") or "",
-            "mt5_password": genuine.get("mt5_master_password") or "", "master_password": genuine.get("mt5_master_password") or "",
-            "mt5_investor_password": genuine.get("mt5_investor_password") or "", "investor_password": genuine.get("mt5_investor_password") or "",
-            "monitoring_enabled": bool(genuine.get("monitoring_enabled", True)), "mt5_account_active": True,
-            "mt5_access_disabled": False, "mt5_reset_reason": None, "admin_note": evidence,
-            "lifecycle_updated_at": now, "updated_at": now,
-        }
+        if genuine:
+            genuine_stage = str(genuine.get("stage") or "phase1").strip().lower()
+            trader_payload = {
+                "current_account_id": genuine.get("id"),
+                "challenge_state": "funded_active" if genuine_stage == "funded" else f"{genuine_stage}_active",
+                "status": "active",
+                "phase": genuine_stage,
+                "mt5_login": genuine.get("mt5_login") or "",
+                "mt5_server": genuine.get("mt5_server") or "",
+                "mt5_master_password": genuine.get("mt5_master_password") or "",
+                "mt5_password": genuine.get("mt5_master_password") or "",
+                "master_password": genuine.get("mt5_master_password") or "",
+                "mt5_investor_password": genuine.get("mt5_investor_password") or "",
+                "investor_password": genuine.get("mt5_investor_password") or "",
+                "monitoring_enabled": bool(genuine.get("monitoring_enabled", True)),
+                "mt5_account_active": True,
+                "mt5_access_disabled": False,
+                "mt5_reset_reason": None,
+                "admin_note": evidence,
+                "lifecycle_updated_at": now,
+                "updated_at": now,
+            }
+            reconcile_message = "Genuine active account preserved"
+        else:
+            # This trader had only the mistaken assignment.
+            # Keep the trader record/login, remove only the false MT5 ownership mirror.
+            trader_payload = {
+                "current_account_id": None,
+                "challenge_state": "no_account",
+                "status": "active",
+                "mt5_login": "",
+                "mt5_server": "",
+                "mt5_master_password": "",
+                "mt5_password": "",
+                "master_password": "",
+                "mt5_investor_password": "",
+                "investor_password": "",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": False,
+                "mt5_reset_reason": None,
+                "admin_note": evidence + " | mistaken assignment removed; no replacement or Second Life created",
+                "lifecycle_updated_at": now,
+                "updated_at": now,
+            }
+            reconcile_message = "Mistaken assignment removed; no replacement created"
+
         if not verified_trader_update(trader_id, trader_payload):
             return bad("Recall completed but trader current-account reconciliation failed", 500)
 
@@ -1224,10 +1266,15 @@ def admin_recall_wrong_assignment():
             "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived", "message": evidence, "created_at": now,
         })
         return ok({
-            "recalled_account_id": account_id, "recalled_mt5_login": account.get("mt5_login"),
-            "current_account_id": genuine.get("id"), "current_mt5_login": genuine.get("mt5_login"),
+            "recalled_account_id": account_id,
+            "recalled_mt5_login": account.get("mt5_login"),
+            "current_account_id": genuine.get("id") if genuine else None,
+            "current_mt5_login": genuine.get("mt5_login") if genuine else None,
             "pool_status": "recalled_hold",
-        }, "Wrong assignment recalled. Genuine account preserved. Rotate both MT5 passwords before reuse.")
+            "replacement_created": False,
+            "second_life_created": False,
+            "trader_reconciliation": reconcile_message,
+        }, "Wrong assignment recalled safely. Rotate both MT5 passwords before reuse.")
     except Exception as exc:
         print("ADMIN RECALL ERROR:", str(exc), flush=True)
         return bad(exc, 500)
