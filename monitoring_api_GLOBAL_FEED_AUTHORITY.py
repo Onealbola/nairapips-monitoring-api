@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "SAFE_WRONG_ASSIGNMENT_RECALL_NO_REPLACEMENT_2026_09_04"
+NAIRAPIPS_MONITORING_RELEASE = "RECALL_TERMINAL_NO_PROGRESSION_2026_09_06"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -1177,10 +1177,24 @@ def admin_recall_wrong_assignment():
         reason = "wrong_assignment_recalled"
         evidence = f"Wrong assignment recalled. {note} | trader_account_id={account_id} | MT5={account.get('mt5_login') or ''}"
 
+        # RECALL TERMINAL AUTHORITY:
+        # A wrong assignment is neither PASSED, BREACHED, RESET nor WAITING NEXT.
+        # It is dead ownership history. Clear any stale pass/progression flags so
+        # no downstream UI or queue can reinterpret it as a progression entitlement.
+        terminal_reason = "wrong_assignment_recalled | [NP_TERMINAL:RECALLED_WRONG_ASSIGNMENT]"
         account_ok, _removed, account_error = _np_adaptive_table_update("trader_accounts", "id", account_id, {
-            "account_status": "archived", "risk_zone": "archived", "archive_reason": reason,
-            "archived_at": now, "breach_reason": None, "breached_at": None,
-            "monitoring_enabled": False, "updated_at": now,
+            "account_status": "archived",
+            "status": "archived",
+            "risk_zone": "archived",
+            "archive_reason": terminal_reason,
+            "archived_at": now,
+            "phase_pass_status": None,
+            "pass_status": None,
+            "passed_at": None,
+            "breach_reason": None,
+            "breached_at": None,
+            "monitoring_enabled": False,
+            "updated_at": now,
         })
         if not account_ok:
             return bad(f"Recall failed while archiving the selected account: {account_error}", 500)
@@ -1258,12 +1272,12 @@ def admin_recall_wrong_assignment():
 
         safe_insert("lifecycle_events", {
             "trader_id": trader_id, "trader_account_id": account_id, "from_state": status_before,
-            "to_state": "archived", "action": "admin_recall_wrong_assignment", "details": evidence,
+            "to_state": "recalled_wrong_assignment", "action": "admin_recall_wrong_assignment", "details": evidence,
             "created_by": str(data.get("admin_username") or data.get("admin_name") or "admin"), "created_at": now,
         })
         safe_insert("monitoring_events", {
             "trader_id": trader_id, "trader_account_id": account_id, "mt5_login": account.get("mt5_login"),
-            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived", "message": evidence, "created_at": now,
+            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived", "message": evidence + " | terminal recalled ownership; no progression entitlement", "created_at": now,
         })
         return ok({
             "recalled_account_id": account_id,
