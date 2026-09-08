@@ -1166,12 +1166,38 @@ def admin_recall_wrong_assignment():
         genuine = remaining[0] if remaining else None
 
         purchase_id = str(account.get("purchase_id") or "").strip()
+        linked_purchase = {}
+        reopen_same_entitlement = False
+        reopen_entitlement_kind = ""
         if purchase_id:
-            purchase_rows = supabase.table("challenge_purchases").select("id,trader_id,trader_account_id").eq("id", purchase_id).limit(1).execute().data or []
+            purchase_rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
             if not purchase_rows:
                 return bad("Linked purchase was not found; recall cancelled before any change", 409)
-            if str(purchase_rows[0].get("trader_id") or trader_id) != trader_id:
+            linked_purchase = purchase_rows[0]
+            if str(linked_purchase.get("trader_id") or trader_id) != trader_id:
                 return bad("Linked purchase belongs to another trader", 409)
+
+            # WRONG-ASSIGNMENT REPLACEMENT LAW:
+            # Recall must NEVER consume a genuine entitlement that already produced
+            # the recalled unused MT5. It must reopen the SAME entitlement, not create
+            # a new Life/reset.
+            #
+            # Current production case: Life 2 / Second Life Phase-1 account.
+            account_stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+            sl_enabled = str(linked_purchase.get("second_life_enabled") or "").strip().lower() in {"true","1","yes","on"}
+            sl_used = str(linked_purchase.get("second_life_used") or "").strip().lower() in {"true","1","yes","on"}
+            sl_status = str(linked_purchase.get("second_life_status") or "").strip().lower()
+            life_number = int(linked_purchase.get("life_number") or 0)
+
+            if (
+                account_stage == "phase1"
+                and sl_enabled
+                and sl_used
+                and life_number >= 2
+                and sl_status in {"life2_active","active","life_2_active"}
+            ):
+                reopen_same_entitlement = True
+                reopen_entitlement_kind = "second_life_phase1"
 
         now = now_iso()
         reason = "wrong_assignment_recalled"
@@ -1200,13 +1226,42 @@ def admin_recall_wrong_assignment():
             return bad(f"Recall failed while archiving the selected account: {account_error}", 500)
 
         if purchase_id:
-            purchase_ok, _removed, purchase_error = _np_adaptive_table_update("challenge_purchases", "id", purchase_id, {
-                "status": "archived", "lifecycle_state": "archived", "account_state": "archived",
-                "trader_account_id": None, "assigned_mt5_id": None, "mt5_login": "", "mt5_server": "",
-                "mt5_master_password": "", "mt5_password": "", "master_password": "",
-                "mt5_investor_password": "", "investor_password": "", "archive_reason": reason,
-                "archived_at": now, "admin_note": evidence + " | no replacement required", "updated_at": now,
-            })
+            if reopen_same_entitlement and reopen_entitlement_kind == "second_life_phase1":
+                purchase_payload = {
+                    # SAME Life 2 remains consumed/owned; only its MT5 slot reopens.
+                    "status": "approved_active",
+                    "lifecycle_state": "phase1_waiting_mt5",
+                    "account_state": "waiting_mt5",
+                    "second_life_enabled": True,
+                    "second_life_used": True,
+                    "second_life_status": "life2_waiting_mt5",
+                    "life_number": 2,
+                    "trader_account_id": None,
+                    "assigned_mt5_id": None,
+                    "mt5_login": "",
+                    "mt5_server": "",
+                    "mt5_master_password": "",
+                    "mt5_password": "",
+                    "master_password": "",
+                    "mt5_investor_password": "",
+                    "investor_password": "",
+                    "archive_reason": None,
+                    "archived_at": None,
+                    "admin_note": evidence + " | SAME LIFE 2 MT5 entitlement reopened after unused wrong assignment recall",
+                    "updated_at": now,
+                }
+            else:
+                purchase_payload = {
+                    "status": "archived", "lifecycle_state": "archived", "account_state": "archived",
+                    "trader_account_id": None, "assigned_mt5_id": None, "mt5_login": "", "mt5_server": "",
+                    "mt5_master_password": "", "mt5_password": "", "master_password": "",
+                    "mt5_investor_password": "", "investor_password": "", "archive_reason": reason,
+                    "archived_at": now, "admin_note": evidence + " | no replacement entitlement existed", "updated_at": now,
+                }
+
+            purchase_ok, _removed, purchase_error = _np_adaptive_table_update(
+                "challenge_purchases", "id", purchase_id, purchase_payload
+            )
             if not purchase_ok:
                 return bad(f"Account archived but linked purchase reconciliation failed: {purchase_error}", 500)
 
@@ -1275,9 +1330,15 @@ def admin_recall_wrong_assignment():
             "to_state": "recalled_wrong_assignment", "action": "admin_recall_wrong_assignment", "details": evidence,
             "created_by": str(data.get("admin_username") or data.get("admin_name") or "admin"), "created_at": now,
         })
+        recall_outcome = (
+            "same Life 2 MT5 entitlement reopened; awaiting replacement MT5"
+            if reopen_same_entitlement
+            else "terminal recalled ownership; no progression entitlement"
+        )
         safe_insert("monitoring_events", {
             "trader_id": trader_id, "trader_account_id": account_id, "mt5_login": account.get("mt5_login"),
-            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived", "message": evidence + " | terminal recalled ownership; no progression entitlement", "created_at": now,
+            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived",
+            "message": evidence + " | " + recall_outcome, "created_at": now,
         })
         return ok({
             "recalled_account_id": account_id,
@@ -1287,8 +1348,14 @@ def admin_recall_wrong_assignment():
             "pool_status": "recalled_hold",
             "replacement_created": False,
             "second_life_created": False,
+            "replacement_entitlement_reopened": bool(reopen_same_entitlement),
+            "replacement_entitlement_kind": reopen_entitlement_kind or None,
             "trader_reconciliation": reconcile_message,
-        }, "Wrong assignment recalled safely. Rotate both MT5 passwords before reuse.")
+        }, (
+            "Wrong assignment recalled safely. Same Life 2 assignment entitlement reopened."
+            if reopen_same_entitlement
+            else "Wrong assignment recalled safely. Rotate both MT5 passwords before reuse."
+        ))
     except Exception as exc:
         print("ADMIN RECALL ERROR:", str(exc), flush=True)
         return bad(exc, 500)
@@ -1925,3 +1992,5 @@ def rule_authority_health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
+# NP_FIX: RECALL_REOPENS_SAME_SECOND_LIFE_MT5_ENTITLEMENT_2026_09_08
