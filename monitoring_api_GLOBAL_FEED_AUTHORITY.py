@@ -1135,19 +1135,55 @@ def admin_recall_wrong_assignment():
                 return ok({"idempotent": True}, "Wrong assignment was already recalled")
             return bad("Only an active account can be recalled", 409)
 
-        trades = supabase.table("trader_trades").select("id").eq("trader_account_id", account_id).limit(1).execute().data or []
+        # FORENSIC RECALL SAFETY 2026-09-11
+        # A mistaken assignment may inherit stale monitoring mirrors (profit/DD/balance)
+        # even when the trader never placed a trade. Those derived mirrors must not, by
+        # themselves, make an unused wrong assignment impossible to recall.
+        #
+        # AUTHORITATIVE BLOCKER = at least one actual trader_trades row tied to this
+        # exact trader_account_id. If a real trade exists, Recall remains blocked and
+        # Admin must use Reset Account. This protects NairaPips from erasing a traded
+        # account while still allowing stale monitoring snapshots to be quarantined.
+        trades = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", account_id).limit(1).execute().data or []
+        )
+
         start = num(account.get("start_balance") or account.get("account_size"))
         balance = num(account.get("current_balance"), start)
         equity = num(account.get("current_equity"), balance)
-        activity = [
-            num(account.get("profit") or account.get("current_profit")),
-            num(account.get("profit_percent") or account.get("current_profit_percent")),
-            num(account.get("dd_used_percent")), num(account.get("absolute_drawdown_percent")),
-            num(account.get("worst_dd_used_percent")), num(account.get("worst_static_drawdown_percent")),
-        ]
-        tolerance = max(0.01, abs(start) * 0.000001)
-        if trades or any(abs(value) > 0.000001 for value in activity) or abs(balance - start) > tolerance or abs(equity - start) > tolerance:
-            return bad("Recall blocked: this account has trading or balance activity. Use Reset Account instead.", 409)
+        profit_value = num(account.get("profit") or account.get("current_profit"))
+        profit_percent = num(account.get("profit_percent") or account.get("current_profit_percent"))
+        dd_used = num(account.get("dd_used_percent"))
+        abs_dd = num(account.get("absolute_drawdown_percent"))
+        worst_dd = num(account.get("worst_dd_used_percent"))
+        worst_static_dd = num(account.get("worst_static_drawdown_percent"))
+        balance_delta = balance - start
+        equity_delta = equity - start
+
+        if trades:
+            return bad(
+                "Recall blocked: an actual trade record exists for this exact assigned account. "
+                "Use Reset Account instead.",
+                409,
+            )
+
+        # No actual trade record exists. Any non-zero balance/equity/profit/DD mirrors
+        # are treated as monitoring evidence only, not trader activity. The recalled MT5
+        # still goes to security hold and cannot be reused until credentials are rotated
+        # and the account is manually revalidated.
+        stale_activity_snapshot = any(abs(v) > 0.000001 for v in (
+            balance_delta, equity_delta, profit_value, profit_percent, dd_used,
+            abs_dd, worst_dd, worst_static_dd,
+        ))
+        if stale_activity_snapshot:
+            print(
+                "RECALL FORENSIC NOTE: no trader_trades row; allowing wrong-assignment recall "
+                f"with stale monitoring mirrors account_id={account_id} "
+                f"mt5={account.get('mt5_login') or ''} start={start} balance={balance} "
+                f"equity={equity} profit={profit_value} profit_pct={profit_percent} "
+                f"dd={dd_used} abs_dd={abs_dd} worst_dd={worst_dd} worst_static_dd={worst_static_dd}"
+            )
 
         remaining = (
             supabase.table("trader_accounts").select("*").eq("trader_id", trader_id)
