@@ -1237,13 +1237,19 @@ def admin_recall_wrong_assignment():
 
         now = now_iso()
         reason = "wrong_assignment_recalled"
-        evidence = f"Wrong assignment recalled. {note} | trader_account_id={account_id} | MT5={account.get('mt5_login') or ''}"
+        journey_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+        evidence = (
+            f"Wrong assignment recalled. {note} | "
+            f"[NP_JOURNEY:{journey_id or 'UNLINKED'}] | "
+            f"[NP_RECALL:{account_id}] | trader_account_id={account_id} | "
+            f"MT5={account.get('mt5_login') or ''}"
+        )
 
         # RECALL TERMINAL AUTHORITY:
         # A wrong assignment is neither PASSED, BREACHED, RESET nor WAITING NEXT.
         # It is dead ownership history. Clear any stale pass/progression flags so
         # no downstream UI or queue can reinterpret it as a progression entitlement.
-        terminal_reason = "wrong_assignment_recalled | [NP_TERMINAL:RECALLED_WRONG_ASSIGNMENT]"
+        terminal_reason = f"wrong_assignment_recalled | [NP_TERMINAL:RECALLED_WRONG_ASSIGNMENT] | [NP_JOURNEY:{journey_id or 'UNLINKED'}] | [NP_RECALL:{account_id}]"
         account_ok, _removed, account_error = _np_adaptive_table_update("trader_accounts", "id", account_id, {
             "account_status": "archived",
             "status": "archived",
