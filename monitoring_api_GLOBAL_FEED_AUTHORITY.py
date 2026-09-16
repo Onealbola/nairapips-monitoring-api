@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "RECALL_TERMINAL_NO_PROGRESSION_2026_09_06"
+NAIRAPIPS_MONITORING_RELEASE = "ACTIVE_ACCOUNT_AUTHORITY_BATCH_TRADE_SYNC_2026_09_16"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -229,6 +229,19 @@ def is_active_pool_for_account(mt5_pool, account):
 
 
 def monitoring_eligibility(account, purchase=None, mt5_pool=None, trader=None, require_server=True):
+    """Exact active trader_account is the live-monitoring authority.
+
+    Lifecycle mirrors in challenge_purchases and mt5_pool can legitimately move
+    to a newer child account (Second Life, payout renewal, funded replacement,
+    etc.). Those mutable mirrors must not silently remove an otherwise genuine
+    active MT5 from monitoring.
+
+    Hard safety contradictions still block:
+      - the exact trader_account is terminal/disabled/superseded
+      - no MT5 server/login
+      - purchase or MT5-pool ownership points to ANOTHER trader
+      - MT5-pool login points to a different login
+    """
     if not is_active_monitoring_account(account):
         return False, "account is not monitorable"
     if require_server and not str((account or {}).get("mt5_server") or "").strip():
@@ -239,21 +252,59 @@ def monitoring_eligibility(account, purchase=None, mt5_pool=None, trader=None, r
         return False, "account mt5_access_disabled is true"
     if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
         return False, "account is superseded"
+
+    account_trader_id = str((account or {}).get("trader_id") or "").strip()
+    account_login = clean_login((account or {}).get("mt5_login"))
     purchase_id = str((account or {}).get("purchase_id") or "").strip()
+
+    # Purchase is journey/provenance evidence, not live monitoring authority.
+    # Only a different OWNER is a hard block. Child-account pointers, MT5 pointer,
+    # pool pointer and waiting/reset lifecycle words are logged but tolerated.
     if purchase_id:
-        ok_purchase, reason = is_active_purchase_for_account(purchase, account)
-        if not ok_purchase:
-            return False, reason
-    ok_pool, reason = is_active_pool_for_account(mt5_pool, account)
-    if not ok_pool:
-        return False, reason
+        if purchase:
+            purchase_trader_id = str((purchase or {}).get("trader_id") or "").strip()
+            if purchase_trader_id and account_trader_id and purchase_trader_id != account_trader_id:
+                return False, "purchase trader_id mismatch"
+            ok_purchase, reason = is_active_purchase_for_account(purchase, account)
+            if not ok_purchase:
+                log_lifecycle_inconsistency(
+                    "purchase mirror disagrees with exact active trader_account; account remains monitorable: " + str(reason),
+                    account, purchase, mt5_pool or {}, trader or {}
+                )
+        else:
+            log_lifecycle_inconsistency(
+                "linked purchase not found; exact active trader_account remains monitorable",
+                account, {}, mt5_pool or {}, trader or {}
+            )
+    else:
+        log_no_purchase_monitoring_allowed(account)
+
+    # MT5 pool is inventory/history after assignment. A stale status or stale
+    # trader_account pointer must not freeze a valid active account. But ownership
+    # to ANOTHER trader or a different MT5 login is a hard safety contradiction.
+    if mt5_pool:
+        pool_trader_id = str((mt5_pool or {}).get("assigned_trader_id") or (mt5_pool or {}).get("trader_id") or "").strip()
+        if pool_trader_id and account_trader_id and pool_trader_id != account_trader_id:
+            return False, "mt5_pool linked to a different trader"
+        pool_login = clean_login((mt5_pool or {}).get("mt5_login"))
+        if pool_login and account_login and pool_login != account_login:
+            return False, "mt5_pool mt5_login mismatch"
+        ok_pool, reason = is_active_pool_for_account(mt5_pool, account)
+        if not ok_pool:
+            log_lifecycle_inconsistency(
+                "mt5_pool mirror disagrees with exact active trader_account; account remains monitorable: " + str(reason),
+                account, purchase or {}, mt5_pool, trader or {}
+            )
+
     if trader:
         t_blob = lifecycle_blob(trader, ["challenge_state", "status", "phase"])
         if any(word in t_blob for word in ("waiting", "reset", "breached", "archived", "disabled", "closed", "passed_review")):
-            log_lifecycle_inconsistency("trader-level lifecycle disagrees with eligible active account; account remains monitorable", account, purchase, mt5_pool, trader)
-    if not purchase_id:
-        log_no_purchase_monitoring_allowed(account)
-    return True, "eligible"
+            log_lifecycle_inconsistency(
+                "trader-level lifecycle disagrees with exact active account; account remains monitorable",
+                account, purchase or {}, mt5_pool or {}, trader
+            )
+
+    return True, "eligible_exact_active_trader_account"
 
 
 def fetch_trader_by_id(trader_id):
@@ -1427,11 +1478,7 @@ def _bulk_rows(table_name, ids, select="*"):
 
 
 def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
-    """Exact account safety checks without writes, alerts or per-row DB queries.
-
-    Discovery must stay read-only and fast. Lifecycle disagreements are handled by
-    lifecycle/event processing elsewhere; they must never make Gunicorn time out.
-    """
+    """Fast read-only version of the exact-active-account monitoring law."""
     if not is_active_monitoring_account(account):
         return False, "account is not monitorable"
     if not str((account or {}).get("mt5_server") or "").strip():
@@ -1443,17 +1490,28 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
     if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
         return False, "account is superseded"
 
+    account_trader_id = str((account or {}).get("trader_id") or "").strip()
+    account_login = clean_login((account or {}).get("mt5_login"))
     purchase_id = str((account or {}).get("purchase_id") or "").strip()
-    if purchase_id:
-        ok_purchase, reason = is_active_purchase_for_account(purchase or {}, account)
-        if not ok_purchase:
-            return False, reason
 
-    ok_pool, reason = is_active_pool_for_account(mt5_pool or {}, account)
-    if not ok_pool:
-        return False, reason
+    # Never let a mutable purchase child-pointer/lifecycle state silence an exact
+    # active trader_account. Different ownership remains a hard block.
+    if purchase_id and purchase:
+        purchase_trader_id = str((purchase or {}).get("trader_id") or "").strip()
+        if purchase_trader_id and account_trader_id and purchase_trader_id != account_trader_id:
+            return False, "purchase trader_id mismatch"
 
-    return True, "eligible"
+    # Pool mismatch to another trader/login is security-sensitive. Other pool
+    # mirror disagreement is not allowed to freeze monitoring.
+    if mt5_pool:
+        pool_trader_id = str((mt5_pool or {}).get("assigned_trader_id") or (mt5_pool or {}).get("trader_id") or "").strip()
+        if pool_trader_id and account_trader_id and pool_trader_id != account_trader_id:
+            return False, "mt5_pool linked to a different trader"
+        pool_login = clean_login((mt5_pool or {}).get("mt5_login"))
+        if pool_login and account_login and pool_login != account_login:
+            return False, "mt5_pool mt5_login mismatch"
+
+    return True, "eligible_exact_active_trader_account"
 
 
 def _fast_rule_values(account, purchase=None, plan=None):
@@ -1848,52 +1906,136 @@ def disable_mt5_access():
 
 @app.route("/sync_trades", methods=["POST", "OPTIONS"])
 def sync_trades():
+    """Fast trade-history sync.
+
+    The previous route performed one Supabase network upsert PER trade. An account
+    with 200-250 historical deals could therefore hold this request for tens of
+    seconds and hit the engine's 60-second timeout/Gunicorn timeout, delaying the
+    rest of the monitoring round.
+
+    V7 validates rows exactly as before, deduplicates ticket+login, then writes in
+    bulk chunks. Live balance/equity snapshots are never made dependent on hundreds
+    of sequential trade-history writes.
+    """
     if request.method == "OPTIONS":
         return ok({})
-    data = request.get_json(silent=True) or {}
-    trades = data.get("trades") or []
-    if not isinstance(trades, list):
-        return bad("trades must be a list")
-    saved = 0
-    skipped = 0
-    account_cache = {}
-    for trade in trades[:500]:
-        if not isinstance(trade, dict):
-            continue
-        row = dict(trade)
-        lookup_id = row.get("trader_account_id") or row.get("current_account_id") or data.get("trader_account_id") or data.get("current_account_id")
-        lookup_login = row.get("mt5_login") or data.get("mt5_login")
-        if not lookup_id:
-            skipped += 1
-            print("TRADE SYNC SKIPPED WITHOUT EXACT ACCOUNT ID:", {"mt5_login": clean_login(lookup_login)}, flush=True)
-            continue
-        cache_key = f"{lookup_id or ''}:{clean_login(lookup_login)}"
-        account = account_cache.get(cache_key)
-        if cache_key not in account_cache:
-            account = get_account_by_id_or_login(lookup_id, lookup_login)
-            account_cache[cache_key] = account
-        if not account:
-            skipped += 1
-            print("TRADE SYNC SKIPPED NON-ACTIVE ACCOUNT:", {"trader_account_id": lookup_id, "mt5_login": clean_login(lookup_login)}, flush=True)
-            continue
-        row["trader_id"] = account.get("trader_id")
-        row["trader_account_id"] = account.get("id")
-        row["mt5_login"] = clean_login(account.get("mt5_login"))
-        row["synced_at"] = now_iso()
-        row["updated_at"] = now_iso()
-        if not row.get("created_at"):
-            row["created_at"] = now_iso()
-        # Keep this fast. Upsert if DB has a suitable unique key, otherwise insert fallback.
-        try:
-            supabase.table("trader_trades").upsert(row, on_conflict="ticket,mt5_login").execute()
-        except Exception:
-            try:
-                supabase.table("trader_trades").insert(row).execute()
-            except Exception as e:
-                print("TRADE SAVE SKIPPED:", e)
+
+    try:
+        data = request.get_json(silent=True) or {}
+        trades = data.get("trades") or []
+        if not isinstance(trades, list):
+            return bad("trades must be a list")
+
+        skipped = 0
+        account_cache = {}
+        validated = []
+
+        for trade in trades[:500]:
+            if not isinstance(trade, dict):
                 continue
-        saved += 1
-    return ok({"received": len(trades), "saved": saved, "skipped_non_active": skipped}, "trades synced")
+            try:
+                row = dict(trade)
+                lookup_id = (
+                    row.get("trader_account_id")
+                    or row.get("current_account_id")
+                    or data.get("trader_account_id")
+                    or data.get("current_account_id")
+                )
+                lookup_login = row.get("mt5_login") or data.get("mt5_login")
+
+                if not lookup_id:
+                    skipped += 1
+                    print("TRADE SYNC SKIPPED WITHOUT EXACT ACCOUNT ID:", {"mt5_login": clean_login(lookup_login)}, flush=True)
+                    continue
+
+                cache_key = f"{lookup_id or ''}:{clean_login(lookup_login)}"
+                if cache_key not in account_cache:
+                    account_cache[cache_key] = get_account_by_id_or_login(lookup_id, lookup_login)
+                account = account_cache.get(cache_key)
+
+                if not account:
+                    skipped += 1
+                    print("TRADE SYNC SKIPPED NON-ACTIVE ACCOUNT:", {"trader_account_id": lookup_id, "mt5_login": clean_login(lookup_login)}, flush=True)
+                    continue
+
+                row["trader_id"] = account.get("trader_id")
+                row["trader_account_id"] = account.get("id")
+                row["mt5_login"] = clean_login(account.get("mt5_login"))
+                row["synced_at"] = now_iso()
+                row["updated_at"] = now_iso()
+                if not row.get("created_at"):
+                    row["created_at"] = now_iso()
+                validated.append(row)
+            except Exception as row_error:
+                skipped += 1
+                print("TRADE SYNC ROW VALIDATION ERROR:", str(row_error)[:400], flush=True)
+
+        # The DB conflict authority is ticket+mt5_login, so collapse duplicate rows
+        # inside this same request before sending them to PostgREST.
+        deduped = {}
+        no_ticket = []
+        for row in validated:
+            ticket = str(row.get("ticket") or "").strip()
+            login = clean_login(row.get("mt5_login"))
+            if ticket and login:
+                deduped[(ticket, login)] = row
+            else:
+                no_ticket.append(row)
+        rows_to_save = list(deduped.values()) + no_ticket
+
+        saved = 0
+        failed = 0
+        chunk_size = 100
+
+        for i in range(0, len(rows_to_save), chunk_size):
+            chunk = rows_to_save[i:i + chunk_size]
+            if not chunk:
+                continue
+            try:
+                # One request per 100 trades instead of one request per trade.
+                supabase.table("trader_trades").upsert(
+                    chunk, on_conflict="ticket,mt5_login"
+                ).execute()
+                saved += len(chunk)
+                continue
+            except Exception as upsert_error:
+                print(
+                    "TRADE BATCH UPSERT FALLBACK:",
+                    {"rows": len(chunk), "error": str(upsert_error)[:350]},
+                    flush=True,
+                )
+
+            # Bulk insert fallback keeps the route bounded. Do not fall back to
+            # hundreds of sequential network calls, because that recreates the
+            # production timeout that caused multi-hour monitoring delays.
+            try:
+                supabase.table("trader_trades").insert(chunk).execute()
+                saved += len(chunk)
+            except Exception as insert_error:
+                failed += len(chunk)
+                print(
+                    "TRADE BATCH SAVE SKIPPED:",
+                    {"rows": len(chunk), "error": str(insert_error)[:500]},
+                    flush=True,
+                )
+
+        result = {
+            "received": len(trades),
+            "validated": len(validated),
+            "deduplicated": len(rows_to_save),
+            "saved": saved,
+            "skipped_non_active": skipped,
+            "failed": failed,
+            "write_mode": "bulk_chunks_100",
+        }
+
+        # Always return JSON. A trade-history problem must not produce an HTML 500
+        # page that stalls the VPS engine. Failed history rows will be retried by
+        # the engine's periodic history sync.
+        return ok(result, "trades synced")
+    except Exception as e:
+        print("SYNC_TRADES FATAL JSON-SAFE ERROR:", repr(e), flush=True)
+        return bad("sync_trades failed safely: " + str(e), 500)
 
 
 @app.route("/traders")
