@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 import os, re, json
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "ACTIVE_ACCOUNT_AUTHORITY_BATCH_TRADE_SYNC_2026_09_16"
+NAIRAPIPS_MONITORING_RELEASE = "V8_EXACT_ENTITLEMENT_RECALL_2026_09_22"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -1157,19 +1158,115 @@ def monitoring_health():
         return bad(e, 500)
 
 
+def _np_recall_main_journey_snapshot(auth_header, trader_id, journey_id):
+    """Read the existing Main-API Journey Authority. This function never mutates lifecycle state."""
+    if not auth_header or not trader_id or not journey_id:
+        return None, "missing journey authority identity"
+    try:
+        qs = urlencode({
+            "trader_id": str(trader_id),
+            "journey_id": str(journey_id),
+            "fresh": str(int(time.time() * 1000)),
+        })
+        req = urlrequest.Request(
+            MAIN_API_URL + "/admin_journey_authority?" + qs,
+            headers={"Authorization": auth_header, "Accept": "application/json"},
+            method="GET",
+        )
+        with urlrequest.urlopen(req, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+        if payload.get("success") is False:
+            return None, str(payload.get("error") or payload.get("message") or "Journey Authority rejected the request")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        journey = data.get("journey") if isinstance(data, dict) else None
+        if not isinstance(journey, dict):
+            return None, "Journey Authority returned no journey"
+        return journey, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _np_recall_consumed_authority(journey, account):
+    """Return the exact entitlement that produced THIS account, or fail closed."""
+    journey = journey or {}
+    account = account or {}
+    if journey.get("blocked"):
+        return None, "Journey Authority is blocked; reconcile the journey before Recall"
+
+    account_id = str(account.get("id") or "").strip()
+    mt5_login = str(account.get("mt5_login") or "").strip()
+    ledger = list(journey.get("ledger") or [])
+
+    exact = []
+    for idx, event in enumerate(ledger):
+        if str((event or {}).get("type") or "").strip().upper() != "MT5_ASSIGNED":
+            continue
+        if account_id and str((event or {}).get("account_id") or "").strip() == account_id:
+            exact.append((idx, event))
+        elif mt5_login and str((event or {}).get("mt5_login") or "").strip() == mt5_login:
+            exact.append((idx, event))
+
+    if not exact:
+        return None, "The selected MT5 has no exact MT5_ASSIGNED event in this journey"
+
+    idx, event = exact[-1]
+    authority = (event or {}).get("authority") or {}
+    if not isinstance(authority, dict):
+        authority = {}
+
+    entitlement_key = str(authority.get("entitlement_key") or "").strip()
+    entitlement_type = str(authority.get("entitlement_type") or "").strip()
+    target_stage = str(authority.get("target_stage") or (event or {}).get("stage") or "").strip().lower()
+    if target_stage in {"live", "funded_live"}:
+        target_stage = "funded"
+
+    account_stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+    if account_stage in {"live", "funded_live"}:
+        account_stage = "funded"
+
+    if not entitlement_key or not entitlement_type:
+        return None, "The selected assignment has no exact entitlement evidence"
+    if not target_stage or target_stage != account_stage:
+        return None, "The selected account stage does not match the entitlement that created it"
+
+    # Never recall an older link after a later MT5 has already been delivered in the same journey.
+    for later in ledger[idx + 1:]:
+        if str((later or {}).get("type") or "").strip().upper() != "MT5_ASSIGNED":
+            continue
+        later_id = str((later or {}).get("account_id") or "").strip()
+        later_login = str((later or {}).get("mt5_login") or "").strip()
+        if later_id and later_id != account_id:
+            return None, f"A later MT5 assignment ({later_login or later_id}) already exists in this journey"
+
+    return {
+        "entitlement_key": entitlement_key,
+        "entitlement_type": entitlement_type,
+        "source_account_id": str(authority.get("source_account_id") or "").strip(),
+        "source_mt5": str(authority.get("source_mt5") or "").strip(),
+        "evidence_id": str(authority.get("evidence_id") or "").strip(),
+        "target_stage": target_stage,
+    }, None
+
+
 @app.route("/admin_recall_wrong_assignment", methods=["POST", "OPTIONS"])
 def admin_recall_wrong_assignment():
-    """Recall one unused mistaken assignment while preserving the real active account."""
+    """Void ONE unused invalid MT5 assignment and restore ONLY the exact entitlement that created it.
+
+    Global safety law:
+      bad MT5 assignment -> Recall exact child -> same entitlement becomes WAITING again.
+    Recall itself never creates a new payout/reset/life/pass entitlement and never advances stage.
+    """
     if request.method == "OPTIONS":
         return ok({})
     _admin, auth_error = require_main_api_admin()
     if auth_error:
         return auth_error
 
+    auth_header = str(request.headers.get("Authorization") or "").strip()
     data = request.get_json(silent=True) or {}
     trader_id = str(data.get("trader_id") or "").strip()
     account_id = str(data.get("trader_account_id") or "").strip()
-    note = str(data.get("admin_note") or "Assigned to wrong trader").strip()
+    note = str(data.get("admin_note") or "Invalid/stale MT5 assignment").strip()
     if not trader_id or not account_id:
         return bad("trader_id and exact trader_account_id are required", 400)
 
@@ -1180,132 +1277,96 @@ def admin_recall_wrong_assignment():
         account = account_rows[0]
         if str(account.get("trader_id") or "") != trader_id:
             return bad("Selected account does not belong to this trader", 409)
-        status_before = str(account.get("account_status") or "").strip().lower()
-        if status_before not in ACTIVE_ACCOUNT_STATUSES:
-            if status_before == "archived" and str(account.get("archive_reason") or "") == "wrong_assignment_recalled":
-                return ok({"idempotent": True}, "Wrong assignment was already recalled")
-            return bad("Only an active account can be recalled", 409)
 
-        # FORENSIC RECALL SAFETY 2026-09-11
-        # A mistaken assignment may inherit stale monitoring mirrors (profit/DD/balance)
-        # even when the trader never placed a trade. Those derived mirrors must not, by
-        # themselves, make an unused wrong assignment impossible to recall.
-        #
-        # AUTHORITATIVE BLOCKER = at least one actual trader_trades row tied to this
-        # exact trader_account_id. If a real trade exists, Recall remains blocked and
-        # Admin must use Reset Account. This protects NairaPips from erasing a traded
-        # account while still allowing stale monitoring snapshots to be quarantined.
+        status_before = str(account.get("account_status") or account.get("status") or "").strip().lower()
+        archive_blob = " ".join(str(account.get(k) or "") for k in ("archive_reason", "admin_note", "status", "account_status")).lower()
+        if "np_terminal:recalled_wrong_assignment" in archive_blob or "wrong_assignment_recalled" in archive_blob:
+            return ok({"idempotent": True, "recalled_account_id": account_id}, "Invalid MT5 was already recalled")
+        if status_before not in ACTIVE_ACCOUNT_STATUSES:
+            return bad("Only the exact active invalid assignment can be recalled", 409)
+
+        journey_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+        if not journey_id:
+            return bad(
+                "Recall blocked safely: this MT5 has no exact journey link. Use manual review; no replacement entitlement was created.",
+                409,
+            )
+
+        # PRE-FLIGHT: prove the exact event/entitlement that created this MT5 BEFORE changing anything.
+        before_journey, before_error = _np_recall_main_journey_snapshot(auth_header, trader_id, journey_id)
+        if before_error:
+            return bad("Recall preflight failed: " + before_error, 409)
+        consumed_authority, authority_error = _np_recall_consumed_authority(before_journey, account)
+        if authority_error:
+            return bad("Recall blocked safely: " + authority_error, 409)
+
+        # Authoritative use check: an actually traded account cannot be undone as an invalid assignment.
         trades = (
             supabase.table("trader_trades").select("id")
             .eq("trader_account_id", account_id).limit(1).execute().data or []
         )
-
-        start = num(account.get("start_balance") or account.get("account_size"))
-        balance = num(account.get("current_balance"), start)
-        equity = num(account.get("current_equity"), balance)
-        profit_value = num(account.get("profit") or account.get("current_profit"))
-        profit_percent = num(account.get("profit_percent") or account.get("current_profit_percent"))
-        dd_used = num(account.get("dd_used_percent"))
-        abs_dd = num(account.get("absolute_drawdown_percent"))
-        worst_dd = num(account.get("worst_dd_used_percent"))
-        worst_static_dd = num(account.get("worst_static_drawdown_percent"))
-        balance_delta = balance - start
-        equity_delta = equity - start
-
         if trades:
             return bad(
-                "Recall blocked: an actual trade record exists for this exact assigned account. "
-                "Use Reset Account instead.",
+                "Recall blocked: an actual trade exists on this exact MT5. Use the appropriate lifecycle/reset/recovery rule instead.",
                 409,
             )
 
-        # No actual trade record exists. Any non-zero balance/equity/profit/DD mirrors
-        # are treated as monitoring evidence only, not trader activity. The recalled MT5
-        # still goes to security hold and cannot be reused until credentials are rotated
-        # and the account is manually revalidated.
-        stale_activity_snapshot = any(abs(v) > 0.000001 for v in (
-            balance_delta, equity_delta, profit_value, profit_percent, dd_used,
-            abs_dd, worst_dd, worst_static_dd,
-        ))
-        if stale_activity_snapshot:
-            print(
-                "RECALL FORENSIC NOTE: no trader_trades row; allowing wrong-assignment recall "
-                f"with stale monitoring mirrors account_id={account_id} "
-                f"mt5={account.get('mt5_login') or ''} start={start} balance={balance} "
-                f"equity={equity} profit={profit_value} profit_pct={profit_percent} "
-                f"dd={dd_used} abs_dd={abs_dd} worst_dd={worst_dd} worst_static_dd={worst_static_dd}"
+        # Financial use is also irreversible through this technical Recall path.
+        payout_use = []
+        try:
+            payout_use = (
+                supabase.table("payouts").select("id,status")
+                .eq("trader_id", trader_id).eq("trader_account_id", account_id)
+                .limit(1).execute().data or []
             )
+            if not payout_use and str(account.get("mt5_login") or "").strip():
+                payout_use = (
+                    supabase.table("payouts").select("id,status")
+                    .eq("trader_id", trader_id).eq("mt5_login", str(account.get("mt5_login") or "").strip())
+                    .limit(1).execute().data or []
+                )
+        except Exception as exc:
+            return bad("Recall payout-use verification failed closed: " + str(exc), 500)
+        if payout_use:
+            return bad("Recall blocked: this exact MT5 already has payout activity and cannot be technically undone.", 409)
 
+        # Preserve any other genuinely active account owned by the trader.
         remaining = (
             supabase.table("trader_accounts").select("*").eq("trader_id", trader_id)
             .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).limit(100).execute().data or []
         )
         remaining = [row for row in remaining if str(row.get("id") or "") != account_id]
-
-        # WRONG-ASSIGNMENT AUTHORITY:
-        # Recall corrects mistaken ownership; it is not a reset/replacement flow.
-        # All safety checks above still require the exact MT5 to be unused:
-        # no trades, no profit/DD activity, and balance/equity unchanged from start.
-        #
-        # If another genuine active account exists, preserve/repoint the trader to it.
-        # If none exists, clear the mistaken MT5 mirror and keep the trader identity/login.
-        # Never create Second Life or an automatic replacement from Recall.
         genuine = remaining[0] if remaining else None
 
-        purchase_id = str(account.get("purchase_id") or "").strip()
-        linked_purchase = {}
-        reopen_same_entitlement = False
-        reopen_entitlement_kind = ""
-        if purchase_id:
-            purchase_rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
-            if not purchase_rows:
-                return bad("Linked purchase was not found; recall cancelled before any change", 409)
-            linked_purchase = purchase_rows[0]
-            if str(linked_purchase.get("trader_id") or trader_id) != trader_id:
-                return bad("Linked purchase belongs to another trader", 409)
-
-            # WRONG-ASSIGNMENT REPLACEMENT LAW:
-            # Recall must NEVER consume a genuine entitlement that already produced
-            # the recalled unused MT5. It must reopen the SAME entitlement, not create
-            # a new Life/reset.
-            #
-            # Current production case: Life 2 / Second Life Phase-1 account.
-            account_stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
-            sl_enabled = str(linked_purchase.get("second_life_enabled") or "").strip().lower() in {"true","1","yes","on"}
-            sl_used = str(linked_purchase.get("second_life_used") or "").strip().lower() in {"true","1","yes","on"}
-            sl_status = str(linked_purchase.get("second_life_status") or "").strip().lower()
-            life_number = int(linked_purchase.get("life_number") or 0)
-
-            if (
-                account_stage == "phase1"
-                and sl_enabled
-                and sl_used
-                and life_number >= 2
-                and sl_status in {"life2_active","active","life_2_active"}
-            ):
-                reopen_same_entitlement = True
-                reopen_entitlement_kind = "second_life_phase1"
-
         now = now_iso()
-        reason = "wrong_assignment_recalled"
-        journey_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+        ent_key = consumed_authority["entitlement_key"]
+        ent_type = consumed_authority["entitlement_type"]
+        evidence_id = consumed_authority.get("evidence_id") or ""
+        source_id = consumed_authority.get("source_account_id") or ""
+        target_stage = consumed_authority["target_stage"]
+        mt5_login = str(account.get("mt5_login") or "").strip()
+
         evidence = (
-            f"Wrong assignment recalled. {note} | "
-            f"[NP_JOURNEY:{journey_id or 'UNLINKED'}] | "
-            f"[NP_RECALL:{account_id}] | trader_account_id={account_id} | "
-            f"MT5={account.get('mt5_login') or ''}"
+            f"Invalid MT5 assignment recalled. {note} | "
+            f"[NP_JOURNEY:{journey_id}] | [NP_RECALL:{account_id}] | "
+            f"[NP_RECALL_ENTITLEMENT:{ent_key}] | [NP_RECALL_TYPE:{ent_type}] | "
+            f"[NP_RECALL_EVIDENCE:{evidence_id}] | [NP_RECALL_SOURCE:{source_id}] | "
+            f"target_stage={target_stage} | MT5={mt5_login}"
+        )
+        terminal_reason = (
+            "wrong_assignment_recalled | [NP_TERMINAL:RECALLED_WRONG_ASSIGNMENT] | "
+            f"[NP_JOURNEY:{journey_id}] | [NP_RECALL:{account_id}] | "
+            f"[NP_RECALL_ENTITLEMENT:{ent_key}] | [NP_RECALL_TYPE:{ent_type}] | "
+            f"[NP_RECALL_EVIDENCE:{evidence_id}] | [NP_RECALL_SOURCE:{source_id}]"
         )
 
-        # RECALL TERMINAL AUTHORITY:
-        # A wrong assignment is neither PASSED, BREACHED, RESET nor WAITING NEXT.
-        # It is dead ownership history. Clear any stale pass/progression flags so
-        # no downstream UI or queue can reinterpret it as a progression entitlement.
-        terminal_reason = f"wrong_assignment_recalled | [NP_TERMINAL:RECALLED_WRONG_ASSIGNMENT] | [NP_JOURNEY:{journey_id or 'UNLINKED'}] | [NP_RECALL:{account_id}]"
+        # 1) Void ONLY the bad child account. It remains immutable audit history.
         account_ok, _removed, account_error = _np_adaptive_table_update("trader_accounts", "id", account_id, {
             "account_status": "archived",
             "status": "archived",
             "risk_zone": "archived",
             "archive_reason": terminal_reason,
+            "admin_note": evidence,
             "archived_at": now,
             "phase_pass_status": None,
             "pass_status": None,
@@ -1318,55 +1379,27 @@ def admin_recall_wrong_assignment():
         if not account_ok:
             return bad(f"Recall failed while archiving the selected account: {account_error}", 500)
 
-        if purchase_id:
-            if reopen_same_entitlement and reopen_entitlement_kind == "second_life_phase1":
-                purchase_payload = {
-                    # SAME Life 2 remains consumed/owned; only its MT5 slot reopens.
-                    "status": "approved_active",
-                    "lifecycle_state": "phase1_waiting_mt5",
-                    "account_state": "waiting_mt5",
-                    "second_life_enabled": True,
-                    "second_life_used": True,
-                    "second_life_status": "life2_waiting_mt5",
-                    "life_number": 2,
-                    "trader_account_id": None,
-                    "assigned_mt5_id": None,
-                    "mt5_login": "",
-                    "mt5_server": "",
-                    "mt5_master_password": "",
-                    "mt5_password": "",
-                    "master_password": "",
-                    "mt5_investor_password": "",
-                    "investor_password": "",
-                    "archive_reason": None,
-                    "archived_at": None,
-                    "admin_note": evidence + " | SAME LIFE 2 MT5 entitlement reopened after unused wrong assignment recall",
-                    "updated_at": now,
-                }
-            else:
-                purchase_payload = {
-                    "status": "archived", "lifecycle_state": "archived", "account_state": "archived",
-                    "trader_account_id": None, "assigned_mt5_id": None, "mt5_login": "", "mt5_server": "",
-                    "mt5_master_password": "", "mt5_password": "", "master_password": "",
-                    "mt5_investor_password": "", "investor_password": "", "archive_reason": reason,
-                    "archived_at": now, "admin_note": evidence + " | no replacement entitlement existed", "updated_at": now,
-                }
-
-            purchase_ok, _removed, purchase_error = _np_adaptive_table_update(
-                "challenge_purchases", "id", purchase_id, purchase_payload
-            )
-            if not purchase_ok:
-                return bad(f"Account archived but linked purchase reconciliation failed: {purchase_error}", 500)
-
+        # 2) Quarantine the invalid Exness credential. NEVER return it to AVAILABLE.
         pool_id = str(account.get("mt5_pool_id") or "").strip()
         if pool_id:
             pool_ok, _removed, pool_error = _np_adaptive_table_update("mt5_pool", "id", pool_id, {
-                "status": "recalled_hold", "assigned_trader_id": None, "assigned_trader_name": None,
-                "assigned_email": None, "trader_account_id": None, "archived_at": now,
-                "archive_reason": reason, "admin_note": evidence + " | ROTATE BOTH PASSWORDS BEFORE REUSE", "updated_at": now,
+                "status": "recalled_hold",
+                "assigned_trader_id": None,
+                "assigned_trader_name": None,
+                "assigned_email": None,
+                "trader_account_id": None,
+                "archived_at": now,
+                "archive_reason": "invalid_or_stale_mt5_recalled",
+                "admin_note": evidence + " | DO NOT REUSE UNTIL BROKER CREDENTIAL IS REVALIDATED",
+                "updated_at": now,
             })
             if not pool_ok:
                 return bad(f"Account recalled but MT5 security hold failed: {pool_error}", 500)
+
+        # IMPORTANT: DO NOT archive/close/reset the root purchase here.
+        # The purchase/payout/pass/reset event is the business authority we need to preserve.
+        # Journey Authority will now ignore this recalled unused child and reveal the SAME
+        # exact entitlement again. Recall creates no new entitlement.
 
         if genuine:
             genuine_stage = str(genuine.get("stage") or "phase1").strip().lower()
@@ -1390,14 +1423,13 @@ def admin_recall_wrong_assignment():
                 "lifecycle_updated_at": now,
                 "updated_at": now,
             }
-            reconcile_message = "Genuine active account preserved"
+            reconcile_message = "Another genuine active account was preserved"
         else:
-            # This trader had only the mistaken assignment.
-            # Keep the trader record/login, remove only the false MT5 ownership mirror.
             trader_payload = {
                 "current_account_id": None,
-                "challenge_state": "no_account",
+                "challenge_state": "waiting_mt5",
                 "status": "active",
+                "phase": target_stage,
                 "mt5_login": "",
                 "mt5_server": "",
                 "mt5_master_password": "",
@@ -1409,46 +1441,112 @@ def admin_recall_wrong_assignment():
                 "mt5_account_active": False,
                 "mt5_access_disabled": False,
                 "mt5_reset_reason": None,
-                "admin_note": evidence + " | mistaken assignment removed; no replacement or Second Life created",
+                "admin_note": evidence + " | exact entitlement restoration pending Main Journey Authority",
                 "lifecycle_updated_at": now,
                 "updated_at": now,
             }
-            reconcile_message = "Mistaken assignment removed; no replacement created"
+            reconcile_message = "Invalid MT5 removed; trader is waiting for the same entitlement to be fulfilled"
 
         if not verified_trader_update(trader_id, trader_payload):
             return bad("Recall completed but trader current-account reconciliation failed", 500)
 
         safe_insert("lifecycle_events", {
-            "trader_id": trader_id, "trader_account_id": account_id, "from_state": status_before,
-            "to_state": "recalled_wrong_assignment", "action": "admin_recall_wrong_assignment", "details": evidence,
-            "created_by": str(data.get("admin_username") or data.get("admin_name") or "admin"), "created_at": now,
+            "trader_id": trader_id,
+            "trader_account_id": account_id,
+            "from_state": status_before,
+            "to_state": "recalled_wrong_assignment",
+            "action": "admin_recall_wrong_assignment",
+            "details": evidence,
+            "created_by": str(data.get("admin_username") or data.get("admin_name") or "admin"),
+            "created_at": now,
         })
-        recall_outcome = (
-            "same Life 2 MT5 entitlement reopened; awaiting replacement MT5"
-            if reopen_same_entitlement
-            else "terminal recalled ownership; no progression entitlement"
+
+        # POST-FLIGHT: the exact entitlement key that was consumed by the invalid child
+        # must be the exact key now outstanding. Anything else fails closed for review.
+        after_journey, after_error = _np_recall_main_journey_snapshot(auth_header, trader_id, journey_id)
+        restored = False
+        restored_entitlement = None
+        review_reason = None
+        if after_error:
+            review_reason = "Post-recall Journey Authority check failed: " + after_error
+        elif after_journey.get("blocked"):
+            review_reason = "Post-recall journey is blocked for reconciliation"
+        else:
+            ent = after_journey.get("outstanding_entitlement") or {}
+            if str(ent.get("entitlement_key") or "").strip() == ent_key:
+                ent_target = str(ent.get("target_stage") or "").strip().lower()
+                if ent_target in {"live", "funded_live"}:
+                    ent_target = "funded"
+                if ent_target == target_stage:
+                    restored = True
+                    restored_entitlement = ent
+                else:
+                    review_reason = "Restored entitlement target stage does not match the recalled assignment"
+            else:
+                review_reason = "The original entitlement key did not reappear after Recall"
+
+        outcome = (
+            f"same exact entitlement restored: {ent_key}; waiting for one {target_stage} MT5"
+            if restored
+            else f"recall quarantined; RECONCILIATION REQUIRED: {review_reason}"
         )
         safe_insert("monitoring_events", {
-            "trader_id": trader_id, "trader_account_id": account_id, "mt5_login": account.get("mt5_login"),
-            "event_type": "admin_recall_wrong_assignment", "risk_zone": "archived",
-            "message": evidence + " | " + recall_outcome, "created_at": now,
+            "trader_id": trader_id,
+            "trader_account_id": account_id,
+            "mt5_login": mt5_login,
+            "event_type": "admin_recall_wrong_assignment",
+            "risk_zone": "archived",
+            "message": evidence + " | " + outcome,
+            "created_at": now,
         })
+
+        if not restored:
+            # Do not roll the bad/invalid MT5 back into service. It remains safely quarantined.
+            # Crucially, no replacement is released unless Main Journey Authority proves the
+            # original entitlement. This is the fail-closed protection against over-assignment.
+            return ok({
+                "recalled_account_id": account_id,
+                "recalled_mt5_login": mt5_login,
+                "pool_status": "recalled_hold",
+                "replacement_created": False,
+                "replacement_entitlement_reopened": False,
+                "requires_review": True,
+                "review_reason": review_reason,
+                "original_entitlement_key": ent_key,
+                "original_entitlement_type": ent_type,
+                "target_stage": target_stage,
+                "trader_reconciliation": reconcile_message,
+            }, "Invalid MT5 recalled and quarantined. No replacement was released because exact entitlement reconciliation requires review.", 202)
+
+        # Current production payout-renewal is event-driven (not broad DB sweeping).
+        # Once Recall has PROVEN the exact same entitlement is restored, wake ONLY
+        # that exact entitlement. For payout renewal this uses its immutable payout_id.
+        # Any failure leaves the entitlement safely WAITING; Recall itself stays valid.
+        replacement_kick = _np_recall_kick_exact_replacement_v9(
+            auth_header=auth_header,
+            trader_id=trader_id,
+            journey_id=journey_id,
+            entitlement_type=ent_type,
+            evidence_id=evidence_id,
+        )
+
         return ok({
             "recalled_account_id": account_id,
-            "recalled_mt5_login": account.get("mt5_login"),
-            "current_account_id": genuine.get("id") if genuine else None,
-            "current_mt5_login": genuine.get("mt5_login") if genuine else None,
+            "recalled_mt5_login": mt5_login,
             "pool_status": "recalled_hold",
-            "replacement_created": False,
-            "second_life_created": False,
-            "replacement_entitlement_reopened": bool(reopen_same_entitlement),
-            "replacement_entitlement_kind": reopen_entitlement_kind or None,
+            "replacement_created": bool((replacement_kick or {}).get("assigned")),
+            "replacement_entitlement_reopened": True,
+            "replacement_entitlement_key": ent_key,
+            "replacement_entitlement_kind": ent_type,
+            "source_account_id": consumed_authority.get("source_account_id") or None,
+            "source_mt5": consumed_authority.get("source_mt5") or None,
+            "evidence_id": consumed_authority.get("evidence_id") or None,
+            "target_stage": target_stage,
+            "restored_entitlement": restored_entitlement,
+            "replacement_kick": replacement_kick,
             "trader_reconciliation": reconcile_message,
-        }, (
-            "Wrong assignment recalled safely. Same Life 2 assignment entitlement reopened."
-            if reopen_same_entitlement
-            else "Wrong assignment recalled safely. Rotate both MT5 passwords before reuse."
-        ))
+        }, "Invalid MT5 recalled safely. The SAME exact entitlement was restored; exact replacement automation was kicked where supported.")
+
     except Exception as exc:
         print("ADMIN RECALL ERROR:", str(exc), flush=True)
         return bad(exc, 500)
@@ -2178,3 +2276,95 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
 # NP_FIX: RECALL_REOPENS_SAME_SECOND_LIFE_MT5_ENTITLEMENT_2026_09_08
+
+
+# ============================================================================
+# NAIRAPIPS MONITORING V9 — EXACT RECALL AUTO-REPLACE KICK
+# 22 SEP 2026
+#
+# Recall remains a two-authority operation:
+#   Monitoring proves/voids the exact unused bad MT5.
+#   Main API Journey Authority proves the SAME entitlement reappeared.
+# Only AFTER both proofs succeed may this helper wake an exact replacement path.
+# Payout renewal is especially important because its broad DB sweep is disabled;
+# the immutable payout_id is therefore used to wake only that renewal.
+# ============================================================================
+
+NAIRAPIPS_MONITORING_RECALL_RELEASE_V9 = "V9_EXACT_RECALL_AUTO_REPLACE_2026_09_22"
+
+
+def _np_recall_post_main_v9(auth_header, path, body, timeout=25):
+    try:
+        payload = json.dumps(body or {}).encode("utf-8")
+        req = urlrequest.Request(
+            MAIN_API_URL + path,
+            data=payload,
+            headers={
+                "Authorization": auth_header,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8") or "{}"
+            data = json.loads(raw)
+            return {
+                "requested": True,
+                "http_status": int(getattr(response, "status", 200) or 200),
+                "success": data.get("success") is not False,
+                "response": data,
+            }
+    except Exception as exc:
+        # This is deliberately non-destructive. The exact entitlement is already
+        # restored and remains waiting if the immediate kick cannot complete.
+        return {
+            "requested": True,
+            "success": False,
+            "deferred": True,
+            "error": str(exc),
+        }
+
+
+def _np_recall_kick_exact_replacement_v9(auth_header, trader_id, journey_id, entitlement_type, evidence_id):
+    ent_type = str(entitlement_type or "").strip().lower()
+    evidence = str(evidence_id or "").strip()
+
+    if ent_type == "payout_renewal":
+        if not evidence:
+            return {
+                "requested": False,
+                "success": False,
+                "deferred": True,
+                "reason": "payout renewal restored but exact payout_id evidence is missing",
+            }
+        result = _np_recall_post_main_v9(
+            auth_header,
+            "/admin/retry_exact_payout_renewal",
+            {"payout_id": evidence},
+            timeout=25,
+        )
+        response = (result or {}).get("response") or {}
+        data = response.get("data") if isinstance(response.get("data"), dict) else response
+        if isinstance(data, dict):
+            # Endpoint is often async. Expose what it actually reported without
+            # claiming a replacement was assigned when it merely started processing.
+            result["state"] = data.get("state") or data.get("status")
+            result["assigned"] = bool(data.get("assigned") or data.get("replacement_account_id") or data.get("mt5_login"))
+            result["mt5_login"] = data.get("mt5_login")
+        result["entitlement_type"] = ent_type
+        result["evidence_id"] = evidence
+        return result
+
+    # Other entitlement classes keep their already-protected stage-specific retry
+    # routes. V8/V79 have restored the exact right; we do not invent a generic
+    # cross-stage auto-fire route here.
+    return {
+        "requested": False,
+        "success": True,
+        "deferred_to_existing_exact_automation": True,
+        "entitlement_type": ent_type,
+        "evidence_id": evidence or None,
+        "journey_id": str(journey_id or "") or None,
+        "trader_id": str(trader_id or "") or None,
+    }
