@@ -603,6 +603,30 @@ def fetch_traders_by_ids(ids):
     return out
 
 
+def get_account_by_id_any_status(account_id=None, mt5_login=None):
+    """Resolve one exact trader_accounts row without active/eligible filtering.
+
+    Used only for terminal/idempotent writes after a verified live snapshot may have
+    already changed the account from active to breached_archived.  If an MT5 login
+    is supplied it MUST still match the row, so this never falls back by trader.
+    """
+    try:
+        if not account_id:
+            return None
+        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        account = rows[0] if rows else None
+        if not account:
+            return None
+        login = clean_login(mt5_login)
+        if login and clean_login(account.get("mt5_login")) != login:
+            log_lifecycle_inconsistency("terminal write supplied trader_account_id but mt5_login does not match", account)
+            return None
+        return account
+    except Exception as e:
+        print("ACCOUNT ANY-STATUS FETCH ERROR:", e, flush=True)
+        return None
+
+
 def get_account_by_id_or_login(account_id=None, mt5_login=None):
     caches = {}
     try:
@@ -1957,9 +1981,13 @@ def disable_mt5_access():
     account_id = data.get("trader_account_id") or data.get("current_account_id")
     if not account_id:
         return bad("Exact trader_account_id is required", 400)
-    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
+    # The immediately preceding /monitoring_snapshot may already have changed
+    # this exact row to breached_archived.  A terminal lock is therefore an
+    # idempotent exact-account write, not an active-account discovery operation.
+    # Resolve by immutable trader_account_id and verify the supplied MT5 login.
+    account = get_account_by_id_any_status(account_id, data.get("mt5_login"))
     if not account:
-        return bad("Active account not found or ownership evidence mismatched", 404)
+        return bad("Exact trader account not found or MT5 ownership evidence mismatched", 404)
     status = str(data.get("status") or "breached").lower()
     reason = data.get("reason") or "MT5 access disabled by monitoring engine"
     payload = {
