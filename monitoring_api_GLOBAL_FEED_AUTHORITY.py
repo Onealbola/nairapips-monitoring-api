@@ -1961,9 +1961,29 @@ def monitoring_snapshot():
     account_id = data.get("trader_account_id") or data.get("current_account_id")
     if not account_id:
         return bad("Exact trader_account_id is required for snapshot", 400)
-    account = get_account_by_id_or_login(account_id, data.get("mt5_login"))
+    # V12 EXACT SNAPSHOT TERMINAL-STATE BRIDGE:
+    # Snapshot requests are already bound to an immutable trader_account_id.
+    # During a target/pass/profit-cap transition the same account may have been
+    # archived/locked milliseconds before the final evidence snapshot arrives.
+    # Resolve that exact account across statuses, while retaining MT5 ownership
+    # verification. This does NOT broaden discovery or reactivate archived rows.
+    account = get_account_by_id_any_status(account_id, data.get("mt5_login"))
     if not account:
-        return bad("Active account not found or ownership evidence mismatched", 404)
+        return bad("Exact trader account not found or MT5 ownership evidence mismatched", 404)
+
+    # Normal live intelligence is only valid while the account is active.
+    # For a terminal account, accept the exact-account request as an idempotent
+    # late snapshot instead of returning a false 404. Terminal persistence has
+    # already been performed by the pass/cap/lock action.
+    if not is_active_monitoring_account(account):
+        return ok({
+            "account_id": account.get("id"),
+            "mt5_login": account.get("mt5_login"),
+            "ignored": True,
+            "reason": "terminal_account_snapshot_already_persisted",
+            "persisted_account_status": account.get("account_status"),
+        }, "terminal account snapshot acknowledged")
+
     result = apply_intelligence(account, data)
     print(f"GLOBAL_FEED SNAPSHOT APPLIED mt5={data.get('mt5_login')} result={result}", flush=True)
     if not isinstance(result, dict) or not result.get("account_write_ok"):
