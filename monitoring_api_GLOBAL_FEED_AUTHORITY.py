@@ -1990,14 +1990,30 @@ def disable_mt5_access():
         return bad("Exact trader account not found or MT5 ownership evidence mismatched", 404)
     status = str(data.get("status") or "breached").lower()
     reason = data.get("reason") or "MT5 access disabled by monitoring engine"
+
+    # V11 PASS-LOCK COMPATIBILITY.
+    # Engine event names are evidence, not trader_accounts.account_status values.
+    pass_status_map = {
+        "phase1_passed": "archived_phase1",
+        "phase2_passed": "archived_phase2",
+    }
+    persisted_account_status = (
+        "breached_archived" if "breach" in status
+        else pass_status_map.get(status, status)
+    )
+
     payload = {
-        "account_status": "breached_archived" if "breach" in status else status,
+        "account_status": persisted_account_status,
         "monitoring_enabled": False,
-        "risk_zone": "breached" if "breach" in status else status,
+        "risk_zone": "breached" if "breach" in status else ("passed" if status in pass_status_map else status),
         "archive_reason": reason,
         "archived_at": now_iso(),
         "updated_at": now_iso(),
     }
+    if status in pass_status_map:
+        payload["phase_pass_status"] = status
+        payload["passed_at"] = account.get("passed_at") or now_iso()
+
     # Redundant final-evidence persistence: if /monitoring_snapshot failed because an
     # optional schema column rejected the full payload, the lock endpoint still saves
     # the real broker numbers with the terminal state.
@@ -2020,10 +2036,34 @@ def disable_mt5_access():
             payload[k] = v
 
     account_write_ok, persisted, write_mode = verified_account_update(account.get("id"), payload)
-    trader_write_ok = verified_trader_update(account.get("trader_id"), {"status": "breached" if "breach" in status else status, "challenge_state": status, "mt5_access_disabled": True, "monitoring_enabled": False, "updated_at": now_iso()})
+    if "breach" in status:
+        trader_lock_update = {
+            "status": "breached",
+            "challenge_state": status,
+            "mt5_access_disabled": True,
+            "monitoring_enabled": False,
+            "updated_at": now_iso(),
+        }
+    elif status in pass_status_map:
+        # Preserve lifecycle state already written by /monitoring_snapshot.
+        trader_lock_update = {
+            "mt5_access_disabled": True,
+            "monitoring_enabled": False,
+            "phase_pass_status": status,
+            "updated_at": now_iso(),
+        }
+    else:
+        trader_lock_update = {
+            "status": status,
+            "challenge_state": status,
+            "mt5_access_disabled": True,
+            "monitoring_enabled": False,
+            "updated_at": now_iso(),
+        }
+    trader_write_ok = verified_trader_update(account.get("trader_id"), trader_lock_update)
     safe_insert("monitoring_events", {"trader_id": account.get("trader_id"), "trader_account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "event_type": status, "risk_zone": "breached" if "breach" in status else status, "message": reason, "balance": payload.get("current_balance"), "equity": payload.get("current_equity"), "drawdown_percent": payload.get("drawdown_percent"), "dd_used_percent": payload.get("dd_used_percent"), "created_at": now_iso()})
     alert_once(account, status, status.upper(), reason, "critical", data)
-    expected_status = "breached_archived" if "breach" in status else status
+    expected_status = persisted_account_status
     persisted_status = str((persisted or {}).get("account_status") or "").lower()
     if not account_write_ok or persisted_status != str(expected_status).lower():
         return bad(f"MT5 lock persistence failed: account_write_ok={account_write_ok}, mode={write_mode}, persisted_status={persisted_status}, expected={expected_status}", 500)
