@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V9_MAGIC_BLACK_BOX_FORENSICS_2026_09_25"
+NAIRAPIPS_MONITORING_RELEASE = "V13_GLOBAL_FEED_BREACH_REASON_PREFLIGHT_2026_09_30"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -975,6 +975,28 @@ def apply_intelligence(account, snapshot):
             update["passed_at"] = None
         elif target_hit:
             update["passed_at"] = now_iso()
+
+    # V13 BREACH-REASON PREFLIGHT.
+    if breached:
+        preflight_reason = str(update.get("breach_reason") or "").strip()
+        if not preflight_reason:
+            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
+                    "breached": True, "account_write_ok": False,
+                    "account_write_mode": "breach_reason_missing",
+                    "persisted_account_status": account.get("account_status")}
+        preflight_ok, preflight_row, preflight_mode = verified_account_update(
+            account.get("id"),
+            {"breach_reason": preflight_reason,
+             "breached_at": update.get("breached_at") or account.get("breached_at") or now_iso(),
+             "archive_reason": update.get("archive_reason") or preflight_reason,
+             "updated_at": now_iso()}
+        )
+        if not preflight_ok or not str((preflight_row or {}).get("breach_reason") or "").strip():
+            print(f"CRITICAL BREACH REASON PREFLIGHT FAILED mt5={account.get('mt5_login')} account_id={account.get('id')} mode={preflight_mode}", flush=True)
+            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
+                    "breached": True, "account_write_ok": False,
+                    "account_write_mode": f"breach_reason_preflight_failed:{preflight_mode}",
+                    "persisted_account_status": (preflight_row or {}).get("account_status") or account.get("account_status")}
 
     account_write_ok, persisted_account, account_write_mode = verified_account_update(account.get("id"), update)
     if not account_write_ok:
@@ -2021,6 +2043,18 @@ def disable_mt5_access():
         "breached_archived" if "breach" in status
         else pass_status_map.get(status, status)
     )
+
+    # V13 BREACH-REASON PREFLIGHT for the final DD Police lock path.
+    if "breach" in status:
+        preflight_ok, preflight_row, preflight_mode = verified_account_update(
+            account.get("id"),
+            {"breach_reason": reason,
+             "breached_at": account.get("breached_at") or now_iso(),
+             "archive_reason": reason,
+             "updated_at": now_iso()}
+        )
+        if not preflight_ok or not str((preflight_row or {}).get("breach_reason") or "").strip():
+            return bad(f"Breach reason preflight failed: account_write_ok={preflight_ok}, mode={preflight_mode}", 500)
 
     payload = {
         "account_status": persisted_account_status,
