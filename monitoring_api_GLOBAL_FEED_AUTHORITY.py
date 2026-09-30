@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V13_GLOBAL_FEED_BREACH_REASON_PREFLIGHT_2026_09_30"
+NAIRAPIPS_MONITORING_RELEASE = "V14_BREACH_REASON_ONLY_PREFLIGHT_2026_09_30"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -976,27 +976,38 @@ def apply_intelligence(account, snapshot):
         elif target_hit:
             update["passed_at"] = now_iso()
 
-    # V13 BREACH-REASON PREFLIGHT.
+    # V14: DB guard-safe breach preflight.
+    # First transaction writes ONLY breach_reason. This deliberately avoids
+    # account_status, breached_at, archived_at and every other terminal field.
+    # After readback proves the reason exists, the existing coherent update
+    # performs the breached_archived transition.
     if breached:
         preflight_reason = str(update.get("breach_reason") or "").strip()
         if not preflight_reason:
-            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
-                    "breached": True, "account_write_ok": False,
-                    "account_write_mode": "breach_reason_missing",
-                    "persisted_account_status": account.get("account_status")}
+            return {
+                "account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
+                "breached": True, "account_write_ok": False,
+                "account_write_mode": "breach_reason_missing",
+                "persisted_account_status": account.get("account_status"),
+            }
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
-            account.get("id"),
-            {"breach_reason": preflight_reason,
-             "breached_at": update.get("breached_at") or account.get("breached_at") or now_iso(),
-             "archive_reason": update.get("archive_reason") or preflight_reason,
-             "updated_at": now_iso()}
+            account.get("id"), {"breach_reason": preflight_reason}
         )
-        if not preflight_ok or not str((preflight_row or {}).get("breach_reason") or "").strip():
-            print(f"CRITICAL BREACH REASON PREFLIGHT FAILED mt5={account.get('mt5_login')} account_id={account.get('id')} mode={preflight_mode}", flush=True)
-            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
-                    "breached": True, "account_write_ok": False,
-                    "account_write_mode": f"breach_reason_preflight_failed:{preflight_mode}",
-                    "persisted_account_status": (preflight_row or {}).get("account_status") or account.get("account_status")}
+        stored_reason = str((preflight_row or {}).get("breach_reason") or "").strip()
+        if not preflight_ok or not stored_reason:
+            print(
+                f"CRITICAL V14 BREACH_REASON-ONLY PREFLIGHT FAILED "
+                f"mt5={account.get('mt5_login')} account_id={account.get('id')} "
+                f"mode={preflight_mode}",
+                flush=True,
+            )
+            return {
+                "account_id": account.get("id"), "mt5_login": account.get("mt5_login"),
+                "breached": True, "account_write_ok": False,
+                "account_write_mode": f"breach_reason_only_preflight_failed:{preflight_mode}",
+                "persisted_account_status": (preflight_row or {}).get("account_status") or account.get("account_status"),
+            }
+        print(f"V14 BREACH_REASON PREFLIGHT VERIFIED MT5={account.get('mt5_login')}", flush=True)
 
     account_write_ok, persisted_account, account_write_mode = verified_account_update(account.get("id"), update)
     if not account_write_ok:
@@ -2044,17 +2055,19 @@ def disable_mt5_access():
         else pass_status_map.get(status, status)
     )
 
-    # V13 BREACH-REASON PREFLIGHT for the final DD Police lock path.
+    # V14: final lock path uses the same reason-only first transaction.
     if "breach" in status:
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
-            account.get("id"),
-            {"breach_reason": reason,
-             "breached_at": account.get("breached_at") or now_iso(),
-             "archive_reason": reason,
-             "updated_at": now_iso()}
+            account.get("id"), {"breach_reason": reason}
         )
-        if not preflight_ok or not str((preflight_row or {}).get("breach_reason") or "").strip():
-            return bad(f"Breach reason preflight failed: account_write_ok={preflight_ok}, mode={preflight_mode}", 500)
+        stored_reason = str((preflight_row or {}).get("breach_reason") or "").strip()
+        if not preflight_ok or not stored_reason:
+            return bad(
+                f"V14 breach_reason-only preflight failed: "
+                f"account_write_ok={preflight_ok}, mode={preflight_mode}",
+                500,
+            )
+        print(f"V14 BREACH_REASON PREFLIGHT VERIFIED MT5={account.get('mt5_login')}", flush=True)
 
     payload = {
         "account_status": persisted_account_status,
