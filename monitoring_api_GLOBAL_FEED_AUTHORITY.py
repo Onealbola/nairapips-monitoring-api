@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V14_BREACH_REASON_ONLY_PREFLIGHT_2026_09_30"
+NAIRAPIPS_MONITORING_RELEASE = "V15_FUNDED_CAP_LOCK_MONITORABLE_2026_09_30"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -81,7 +81,7 @@ def valid_login(v):
     return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL"]))
 
 
-ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active"}
+ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active", "funded_profit_cap_reached"}
 TERMINAL_ACCOUNT_WORDS = ("archived", "breached", "closed", "locked", "disabled", "passed", "reset")
 PURCHASE_BLOCK_WORDS = ("waiting", "reset", "archived", "breached", "disabled", "closed", "cancelled", "canceled", "rejected", "passed_review")
 POOL_ACTIVE_STATUSES = {"assigned", "active", "in_use", "used", "allocated", "assigned_active"}
@@ -101,7 +101,7 @@ def is_active_monitoring_account(row):
         return False
     if (row or {}).get("archived_at") or (row or {}).get("reset_at"):
         return False
-    if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"}:
+    if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"} and not is_funded_cap_lock(row):
         return False
     return valid_login((row or {}).get("mt5_login"))
 
@@ -112,6 +112,16 @@ def bool_false(value):
 
 def bool_true(value):
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def is_funded_cap_lock(row):
+    """15% funded cap is a live financial lock, not a terminal lifecycle state.
+
+    The account must remain in the monitoring feed so the watchdog can continue
+    enforcing no-further-trading while payout is outstanding.
+    """
+    status = str((row or {}).get("account_status") or (row or {}).get("status") or "").strip().lower()
+    return status == "funded_profit_cap_reached"
 
 
 def lifecycle_blob(row, keys):
@@ -249,7 +259,7 @@ def monitoring_eligibility(account, purchase=None, mt5_pool=None, trader=None, r
         return False, "account has no mt5_server"
     if bool_false((account or {}).get("monitoring_enabled")):
         return False, "account monitoring_enabled is false"
-    if bool_true((account or {}).get("mt5_access_disabled")):
+    if bool_true((account or {}).get("mt5_access_disabled")) and not is_funded_cap_lock(account):
         return False, "account mt5_access_disabled is true"
     if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
         return False, "account is superseded"
@@ -1640,7 +1650,7 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
         return False, "account has no mt5_server"
     if bool_false((account or {}).get("monitoring_enabled")):
         return False, "account monitoring_enabled is false"
-    if bool_true((account or {}).get("mt5_access_disabled")):
+    if bool_true((account or {}).get("mt5_access_disabled")) and not is_funded_cap_lock(account):
         return False, "account mt5_access_disabled is true"
     if (account or {}).get("superseded_at") or (account or {}).get("replaced_at") or bool_true((account or {}).get("superseded")):
         return False, "account is superseded"
@@ -1860,7 +1870,9 @@ def _fast_monitorable_feed():
             continue
         if not str(a.get("mt5_server") or "").strip():
             continue
-        if bool_false(a.get("monitoring_enabled")) or bool_true(a.get("mt5_access_disabled")):
+        if bool_false(a.get("monitoring_enabled")):
+            continue
+        if bool_true(a.get("mt5_access_disabled")) and not is_funded_cap_lock(a):
             continue
         if a.get("superseded_at") or a.get("replaced_at") or bool_true(a.get("superseded")):
             continue
