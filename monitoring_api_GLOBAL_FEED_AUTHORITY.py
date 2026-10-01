@@ -1,3 +1,5 @@
+# V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
+NAIRAPIPS_MONITORING_RELEASE = "NAIRAPIPS_MONITORING_API_V17_BREACH_CONSTRAINT_COMPAT_2026_10_01"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -975,7 +977,9 @@ def apply_intelligence(account, snapshot):
         update["archived_at"] = now_iso()
         update["archive_reason"] = snapshot.get("reason") or ("Static drawdown breached" if breached else "Target reached")
         if breached:
-            update["breached_at"] = account.get("breached_at") or now_iso()
+            _breach_ts = account.get("breach_at") or account.get("breached_at") or now_iso()
+            update["breach_at"] = _breach_ts
+            update["breached_at"] = _breach_ts
             update["breach_reason"] = snapshot.get("reason") or (
                 f"Static {dd_limit_percent:g}% drawdown breached. "
                 f"Lowest/current evidence reached {min(lowest, equity, current_balance):,.2f} "
@@ -1001,7 +1005,11 @@ def apply_intelligence(account, snapshot):
                 "persisted_account_status": account.get("account_status"),
             }
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
-            account.get("id"), {"breach_reason": preflight_reason}
+            account.get("id"), {
+                "breach_reason": preflight_reason,
+                "breach_at": update.get("breach_at") or now_iso(),
+                "breach_equity_level": update.get("breach_equity_level") or min(lowest, equity, current_balance),
+            }
         )
         stored_reason = str((preflight_row or {}).get("breach_reason") or "").strip()
         if not preflight_ok or not stored_reason:
@@ -2069,8 +2077,22 @@ def disable_mt5_access():
 
     # V14: final lock path uses the same reason-only first transaction.
     if "breach" in status:
+        _guard_breach_at = account.get("breach_at") or account.get("breached_at") or now_iso()
+        _guard_breach_level = (
+            data.get("breach_equity_level")
+            if data.get("breach_equity_level") not in (None, "")
+            else data.get("equity")
+            if data.get("equity") not in (None, "")
+            else account.get("breach_equity_level")
+            if account.get("breach_equity_level") not in (None, "")
+            else account.get("current_equity")
+        )
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
-            account.get("id"), {"breach_reason": reason}
+            account.get("id"), {
+                "breach_reason": reason,
+                "breach_at": _guard_breach_at,
+                "breach_equity_level": _guard_breach_level,
+            }
         )
         stored_reason = str((preflight_row or {}).get("breach_reason") or "").strip()
         if not preflight_ok or not stored_reason:
@@ -2107,7 +2129,20 @@ def disable_mt5_access():
         "drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
         "dd_used_percent": data.get("dd_used_percent"),
         "phase_pass_status": "" if "breach" in status else data.get("phase_pass_status"),
-        "breached_at": now_iso() if "breach" in status else account.get("breached_at"),
+        # Production DB guard requires breach_reason + breach_at + breach_equity_level
+        # in the same terminal transition. Keep breached_at too for compatibility
+        # with older readers, but breach_at is the constraint-authoritative field.
+        "breach_at": (account.get("breach_at") or account.get("breached_at") or now_iso()) if "breach" in status else account.get("breach_at"),
+        "breached_at": (account.get("breached_at") or account.get("breach_at") or now_iso()) if "breach" in status else account.get("breached_at"),
+        "breach_equity_level": (
+            data.get("breach_equity_level")
+            if data.get("breach_equity_level") not in (None, "")
+            else data.get("equity")
+            if data.get("equity") not in (None, "")
+            else account.get("breach_equity_level")
+            if account.get("breach_equity_level") not in (None, "")
+            else account.get("current_equity")
+        ) if "breach" in status else account.get("breach_equity_level"),
         "breach_reason": reason if "breach" in status else account.get("breach_reason"),
     }
     for k, v in evidence_map.items():
