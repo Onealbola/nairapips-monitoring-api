@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V15_FUNDED_CAP_LOCK_MONITORABLE_2026_09_30"
+NAIRAPIPS_MONITORING_RELEASE = "V18_STALE_MT5_FEED_QUARANTINE_2026_10_01"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -1871,9 +1871,37 @@ def _fast_monitorable_feed():
         or []
     )
 
+    # V18 STALE MT5 FEED QUARANTINE (read-only / reversible).
+    # Business evidence: current NairaPips allocation series is 4772... and newer;
+    # older login series are only quarantined when the account record itself is
+    # also at least 21 days old. This does NOT archive/delete/change lifecycle or
+    # monitoring_enabled. It only keeps stale historical credentials out of the
+    # high-speed DD population. A recent account is never excluded by login alone.
+    from datetime import datetime, timezone, timedelta
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=21)
+    stale_quarantined = []
+
+    def _v18_stale_feed_candidate(a):
+        login = clean_login((a or {}).get("mt5_login"))
+        try:
+            login_n = int(login)
+        except Exception:
+            return False
+        # Current allocation series starts at 4772...; historical lower series
+        # must additionally prove age >=21d before feed-only quarantine.
+        if login_n >= 477200000:
+            return False
+        created = _parse_iso_dt((a or {}).get("created_at") or (a or {}).get("started_at"))
+        if created is None:
+            return False  # fail closed: unknown age stays protected
+        return created <= stale_cutoff
+
     # Cheapest account-level safety first.
     base = []
     for a in rows:
+        if _v18_stale_feed_candidate(a):
+            stale_quarantined.append(clean_login(a.get("mt5_login")))
+            continue
         if not is_active_monitoring_account(a):
             continue
         if not str(a.get("mt5_server") or "").strip():
@@ -1989,6 +2017,7 @@ def _fast_monitorable_feed():
             "monitorable": len(out),
             "excluded": len(excluded),
             "ambiguous": ambiguous,
+            "stale_quarantined": len(stale_quarantined),
         },
         flush=True,
     )
