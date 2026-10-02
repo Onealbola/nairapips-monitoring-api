@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V34_STRICT_EXCHANGE_MULTI_JOURNEY_SAFE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V35_POSITIVE_CURRENT_PROOF_GATE_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2191,6 +2191,9 @@ def _retire_registry_row(reg, reason):
         return False
 
 
+_LAST_CURRENT_PROOF_QUARANTINE = []
+
+
 def _monitoring_registry_rows():
     """STRICT EXCHANGE ROSTER.
 
@@ -2198,7 +2201,11 @@ def _monitoring_registry_rows():
     No same-login duplicate rebinding is allowed here.
 
     Authority:
-      assignment/purchase pointer -> monitoring_registry -> DD Police
+      POSITIVE CURRENT PROOF -> monitoring_registry -> DD Police
+
+    A row is admitted only when NairaPips can positively prove that the exact
+    trader_account is current NOW. Historical rows that merely "look active"
+    are quarantined from the feed and NEVER consume a shard slot.
 
     OLD parent rows are retired when:
       * registry says they have a successor,
@@ -2236,8 +2243,86 @@ def _monitoring_registry_rows():
         select="*",
     )
 
+    registry_account_ids = [
+        str(r.get("trader_account_id") or "").strip()
+        for r in registry
+        if str(r.get("trader_account_id") or "").strip()
+    ]
+    registry_trader_ids = sorted({
+        str(r.get("trader_id") or "").strip()
+        for r in registry
+        if str(r.get("trader_id") or "").strip()
+    })
+
+    # Reverse purchase lookup is essential because some legitimate production
+    # accounts have trader_accounts.purchase_id / registry.purchase_id = NULL
+    # even though challenge_purchases.trader_account_id points to them.
+    reverse_purchase_rows = []
+    try:
+        if registry_trader_ids:
+            reverse_purchase_rows = (
+                supabase.table("challenge_purchases")
+                .select("*")
+                .in_("trader_id", registry_trader_ids)
+                .limit(5000)
+                .execute().data or []
+            )
+    except Exception as exc:
+        print("CURRENT PROOF PURCHASE LOOKUP ERROR:", repr(exc), flush=True)
+
+    purchases_by_account = {}
+    purchases_by_trader = {}
+    for p in reverse_purchase_rows:
+        tid = str(p.get("trader_id") or "").strip()
+        aid = str(p.get("trader_account_id") or "").strip()
+        if tid:
+            purchases_by_trader.setdefault(tid, []).append(p)
+        if aid:
+            purchases_by_account.setdefault(aid, []).append(p)
+
+    payout_rows = []
+    try:
+        if registry_account_ids:
+            payout_rows = (
+                supabase.table("payouts")
+                .select("*")
+                .in_("trader_account_id", registry_account_ids)
+                .limit(5000)
+                .execute().data or []
+            )
+    except Exception as exc:
+        print("CURRENT PROOF PAYOUT LOOKUP ERROR:", repr(exc), flush=True)
+
+    payouts_by_account = {}
+    for po in payout_rows:
+        aid = str(po.get("trader_account_id") or "").strip()
+        if aid:
+            payouts_by_account.setdefault(aid, []).append(po)
+
+    activate_rows = []
+    try:
+        if registry_account_ids:
+            activate_rows = (
+                supabase.table("monitoring_registry_events")
+                .select("*")
+                .eq("event_type", "ACTIVATE")
+                .in_("trader_account_id", registry_account_ids)
+                .limit(5000)
+                .execute().data or []
+            )
+    except Exception as exc:
+        print("CURRENT PROOF EVENT LOOKUP ERROR:", repr(exc), flush=True)
+
+    direct_activation_accounts = {
+        str(ev.get("trader_account_id") or "").strip()
+        for ev in activate_rows
+        if str(ev.get("trader_account_id") or "").strip()
+        and "bootstrap" not in str(ev.get("reason") or "").lower()
+    }
+
     live = []
     rejected = []
+    quarantined = []
 
     def _retire(reg, reason, successor=None):
         try:
@@ -2259,6 +2344,64 @@ def _monitoring_registry_rows():
             )
         except Exception as exc:
             print("STRICT EXCHANGE RETIRE FAILED:", repr(exc), flush=True)
+
+    def _payout_is_open(po):
+        status = str((po or {}).get("status") or "").strip().lower()
+        if status not in {
+            "pending", "requested", "submitted", "pending_review",
+            "awaiting_review", "under_review", "approved",
+            "processing", "payment_processing",
+        }:
+            return False
+        return not str((po or {}).get("paid_at") or "").strip()
+
+    def _positive_current_proof(reg, account, trader, purchase):
+        rid = str((account or {}).get("id") or reg.get("trader_account_id") or "").strip()
+        trader_id = str((account or {}).get("trader_id") or reg.get("trader_id") or "").strip()
+        login = clean_login((account or {}).get("mt5_login") or reg.get("mt5_login"))
+
+        stored = str(reg.get("current_proof_source") or "").strip().lower()
+        accepted_stored = {
+            "purchase_current_pointer",
+            "direct_assignment_event",
+            "open_payout_exact_account",
+            "purchase_current_watchdog",
+            "purchase_exact_account_pointer",
+            "purchase_exact_mt5_pointer",
+            "trader_current_pointer",
+        }
+        if stored in accepted_stored:
+            return True, stored, purchase
+
+        # Exact purchase account pointer.
+        exact = list(purchases_by_account.get(rid) or [])
+        if exact:
+            exact.sort(key=lambda p: str(p.get("updated_at") or p.get("created_at") or ""), reverse=True)
+            return True, "purchase_exact_account_pointer", exact[0]
+
+        # Exact purchase MT5 pointer + same trader. This repairs legacy rows whose
+        # purchase_id was never copied into trader_accounts/registry.
+        for p in purchases_by_trader.get(trader_id) or []:
+            current_login = clean_login(p.get("current_mt5_login"))
+            purchase_login = clean_login(p.get("mt5_login"))
+            if login and login in {current_login, purchase_login}:
+                return True, "purchase_exact_mt5_pointer", p
+
+        # Exact open payout is live financial responsibility and therefore proof.
+        for po in payouts_by_account.get(rid) or []:
+            if _payout_is_open(po):
+                return True, "open_payout_exact_account", purchase
+
+        # Trader pointer is positive proof only. A mismatch never kills another
+        # legitimate parallel account.
+        if str((trader or {}).get("current_account_id") or "").strip() == rid:
+            return True, "trader_current_pointer", purchase
+
+        # All new/manual assignments through V119+ generate ACTIVATE events.
+        if rid in direct_activation_accounts:
+            return True, "direct_assignment_event", purchase
+
+        return False, "no_positive_current_assignment_proof", purchase
 
     for reg in registry:
         rid = str(reg.get("trader_account_id") or "").strip()
@@ -2284,6 +2427,34 @@ def _monitoring_registry_rows():
         if is_term:
             _retire(reg, term_reason or "terminal_exact_source")
             rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": f"terminal_exact_source:{term_reason}"})
+            continue
+
+        # V35 POSITIVE-PROOF GATE.
+        # "Looks active" is not enough. If NairaPips cannot prove this exact
+        # account is current, it is excluded from the shard feed WITHOUT mutating
+        # trader lifecycle history. This is a quarantine, not a deletion.
+        proof_ok, proof_source, proof_purchase = _positive_current_proof(
+            reg, account, trader, purchase
+        )
+        if proof_purchase:
+            purchase = proof_purchase
+            if not purchase_id:
+                purchase_id = str(purchase.get("id") or "").strip()
+
+        if not proof_ok:
+            quarantined.append({
+                "trader_account_id": rid,
+                "trader_id": trader_id,
+                "mt5_login": reg.get("mt5_login") or account.get("mt5_login"),
+                "stage": account.get("stage") or account.get("phase"),
+                "account_status": account.get("account_status"),
+                "reason": proof_source,
+                "pool_exact_support": bool(
+                    pool
+                    and str(pool.get("trader_account_id") or "").strip() == rid
+                    and clean_login(pool.get("mt5_login")) == clean_login(account.get("mt5_login"))
+                ),
+            })
             continue
 
         # Purchase pointer is the journey-slot authority. If NEW exists, OLD is out.
@@ -2434,9 +2605,12 @@ def _monitoring_registry_rows():
             "risk_zone": account.get("risk_zone") or "safe",
             "monitoring_state": reg.get("monitoring_state"),
             "registry_version": reg.get("version"),
-            "_source_of_truth": "monitoring_registry_strict_exchange",
+            "current_proof_source": proof_source,
+            "_source_of_truth": "monitoring_registry_positive_current_proof",
         })
 
+    global _LAST_CURRENT_PROOF_QUARANTINE
+    _LAST_CURRENT_PROOF_QUARANTINE = quarantined
     return live, rejected
 
 
@@ -2455,6 +2629,9 @@ def monitoring_exchange_health():
             "strict_exchange_mode": True,
             "multi_journey_safe": True,
             "live_current_instances": len(live),
+            "positive_proof_gate": True,
+            "quarantined_unproven_count": len(_LAST_CURRENT_PROOF_QUARANTINE),
+            "quarantined_unproven": _LAST_CURRENT_PROOF_QUARANTINE[:100],
             "rejected_or_retired_this_read": len(rejected),
             "rejection_reasons": reasons,
             "sample_rejected": rejected[:100],
@@ -2704,8 +2881,11 @@ def dd_registry_coverage_health():
         ready = (len(rejected) == 0 and len(invalid) == 0 and len(out) > 0)
         return ok({
             "release": NAIRAPIPS_MONITORING_RELEASE,
-            "dd_feed_source": "monitoring_registry",
+            "dd_feed_source": "monitoring_registry_positive_current_proof",
             "registry_dd_population": len(out),
+            "positive_proof_gate": True,
+            "quarantined_unproven_count": len(_LAST_CURRENT_PROOF_QUARANTINE),
+            "quarantined_unproven": _LAST_CURRENT_PROOF_QUARANTINE[:100],
             "expected_shard_counts": {
                 "shard_1": expected[1],
                 "shard_2": expected[2],
