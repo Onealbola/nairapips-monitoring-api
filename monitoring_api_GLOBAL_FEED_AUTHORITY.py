@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V27_AUTO_RETIRE_TERMINAL_REGISTRY_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V28_CREDENTIAL_BUNDLE_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2151,6 +2151,11 @@ def _monitoring_registry_rows():
         [a.get("purchase_id") for a in account_map.values()],
         select="*",
     )
+    pool_map = _bulk_rows(
+        "mt5_pool",
+        [a.get("mt5_pool_id") for a in account_map.values()],
+        select="*",
+    )
 
     live = []
     rejected = []
@@ -2175,6 +2180,65 @@ def _monitoring_registry_rows():
         # Build the same contract the current engine already understands.
         trader = trader_map.get(str(account.get("trader_id") or "")) or {}
         purchase = purchase_map.get(str(account.get("purchase_id") or "")) or {}
+        pool = pool_map.get(str(account.get("mt5_pool_id") or "")) or {}
+
+        # Exact-assignment credential bundle.
+        # We never trust a mirror that points to a different login/trader/account.
+        account_login = clean_login(account.get("mt5_login"))
+        account_trader_id = str(account.get("trader_id") or "").strip()
+        account_id = str(account.get("id") or "").strip()
+
+        pool_ok = bool(pool)
+        if pool_ok:
+            pool_login = clean_login(pool.get("mt5_login"))
+            pool_tid = str(pool.get("assigned_trader_id") or pool.get("trader_id") or "").strip()
+            pool_aid = str(pool.get("trader_account_id") or "").strip()
+            if pool_login and pool_login != account_login:
+                pool_ok = False
+            if pool_tid and account_trader_id and pool_tid != account_trader_id:
+                pool_ok = False
+            if pool_aid and account_id and pool_aid != account_id:
+                pool_ok = False
+
+        purchase_ok = bool(purchase)
+        if purchase_ok:
+            p_login = clean_login(purchase.get("mt5_login"))
+            p_tid = str(purchase.get("trader_id") or "").strip()
+            p_aid = str(purchase.get("trader_account_id") or "").strip()
+            if p_login and p_login != account_login:
+                purchase_ok = False
+            if p_tid and account_trader_id and p_tid != account_trader_id:
+                purchase_ok = False
+            if p_aid and account_id and p_aid != account_id:
+                purchase_ok = False
+
+        def _unique_secret_values(rows, keys):
+            out = []
+            seen = set()
+            for row in rows:
+                if not row:
+                    continue
+                for key in keys:
+                    value = str(row.get(key) or "").strip()
+                    if value and value not in seen:
+                        seen.add(value)
+                        out.append(value)
+            return out
+
+        credential_rows = [account]
+        if pool_ok:
+            credential_rows.append(pool)
+        if purchase_ok:
+            credential_rows.append(purchase)
+
+        investor_candidates = _unique_secret_values(
+            credential_rows,
+            ["mt5_investor_password", "investor_password", "investor"],
+        )
+        master_candidates = _unique_secret_values(
+            credential_rows,
+            ["mt5_master_password", "mt5_password", "master_password", "password"],
+        )
 
         rule_values = _fast_rule_values(account, purchase, {})
         live.append({
@@ -2195,11 +2259,19 @@ def _monitoring_registry_rows():
             "mt5_access_disabled": bool_true(account.get("mt5_access_disabled")),
             "mt5_login": clean_login(account.get("mt5_login")),
             "mt5_server": account.get("mt5_server") or "",
-            "mt5_master_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
-            "mt5_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
-            "master_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
-            "mt5_investor_password": account.get("mt5_investor_password") or account.get("investor_password") or "",
-            "investor_password": account.get("mt5_investor_password") or account.get("investor_password") or "",
+            "mt5_master_password": (master_candidates[0] if master_candidates else ""),
+            "mt5_password": (master_candidates[0] if master_candidates else ""),
+            "master_password": (master_candidates[0] if master_candidates else ""),
+            "mt5_investor_password": (investor_candidates[0] if investor_candidates else ""),
+            "investor_password": (investor_candidates[0] if investor_candidates else ""),
+            "mt5_investor_password_candidates": investor_candidates,
+            "mt5_master_password_candidates": master_candidates,
+            "credential_pool_match": pool_ok,
+            "credential_purchase_match": purchase_ok,
+            "credential_candidate_counts": {
+                "investor": len(investor_candidates),
+                "master": len(master_candidates),
+            },
             "account_size": num(account.get("account_size") or account.get("start_balance")),
             "dd_limit_percent": rule_values["dd_limit_percent"],
             "dd_authority_present": rule_values["dd_authority_present"],
