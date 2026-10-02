@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V28_CREDENTIAL_BUNDLE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V29_DD_REGISTRY_AUTHORITY_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2405,12 +2405,121 @@ def monitoring_registry_health():
 
 @app.route("/monitorable_accounts")
 def monitorable_accounts():
-    """Fast, read-only discovery endpoint for the Windows MT5 engine."""
+    """DD POLICE AUTHORITY FEED — exact current Monitoring Registry only.
+
+    IMPORTANT:
+    The four stable DD Police V3.6 shard programs remain unchanged. They already
+    consume /monitorable_accounts. V29 changes only the server-side source behind
+    that established contract:
+
+        Monitoring Registry -> exact trader_account revalidation -> DD shards
+
+    Fail-closed law:
+      * never fall back to the historical/broad discovery population;
+      * if registry rows cannot be read/revalidated, return an error;
+      * the V3.6 shards retain their last good in-memory population when refresh
+        fails, rather than replacing it with guessed/historical accounts.
+    """
     try:
-        out = _fast_monitorable_feed()
-        return ok(out, f"{len(out)} monitorable account(s)")
+        out, rejected = _monitoring_registry_rows()
+
+        # A rejected registry row means lifecycle and registry disagree. Do not
+        # silently feed a partial roster to DD Police; surface the inconsistency.
+        if rejected:
+            print(
+                "DD REGISTRY FEED BLOCKED: rejected registry rows",
+                {"accepted": len(out), "rejected": len(rejected), "sample": rejected[:20]},
+                flush=True,
+            )
+            return bad({
+                "error": "DD registry roster contains rejected source rows",
+                "accepted_count": len(out),
+                "rejected_count": len(rejected),
+                "rejected": rejected[:100],
+                "release": NAIRAPIPS_MONITORING_RELEASE,
+            }, 503)
+
+        if not out:
+            print("DD REGISTRY FEED BLOCKED: zero current registry accounts", flush=True)
+            return bad({
+                "error": "DD registry returned zero current accounts",
+                "release": NAIRAPIPS_MONITORING_RELEASE,
+            }, 503)
+
+        for row in out:
+            row["_source_of_truth"] = "monitoring_registry_dd_authority"
+            row["_dd_feed_release"] = NAIRAPIPS_MONITORING_RELEASE
+
+        print(
+            "DD REGISTRY FEED COMPLETE:",
+            {"monitorable": len(out), "rejected": 0},
+            flush=True,
+        )
+        # Preserve the exact legacy response envelope expected by V3.6:
+        # ok(list) => {"data":[...], ...}; its unpack_rows() reads data directly.
+        return ok(out, f"{len(out)} registry-authoritative DD account(s)")
     except Exception as e:
-        print("FAST DISCOVERY FATAL ERROR:", repr(e), flush=True)
+        print("DD REGISTRY FEED FATAL ERROR:", repr(e), flush=True)
+        return bad(e, 500)
+
+
+def _dd_owner_shard(login, total_shards=4):
+    """Mirror the unchanged V3.6 rendezvous-hash ownership law."""
+    login = clean_login(login)
+    n = max(int(total_shards or 1), 1)
+    if n <= 1:
+        return 1
+    best_shard = 1
+    best_score = -1
+    key = str(login).encode("utf-8")
+    import hashlib
+    for shard in range(1, n + 1):
+        digest = hashlib.sha256(key + b"|" + str(shard).encode("ascii")).digest()
+        score = int.from_bytes(digest[:8], "big", signed=False)
+        if score > best_score:
+            best_score = score
+            best_shard = shard
+    return best_shard
+
+
+@app.route("/dd_registry_coverage_health", methods=["GET"])
+def dd_registry_coverage_health():
+    """Read-only proof of the exact roster the four unchanged DD shards should receive."""
+    try:
+        out, rejected = _monitoring_registry_rows()
+        expected = {1: 0, 2: 0, 3: 0, 4: 0}
+        invalid = []
+        for row in out:
+            login = clean_login(row.get("mt5_login"))
+            server = str(row.get("mt5_server") or "").strip()
+            if not login or not login.isdigit() or not server:
+                invalid.append({
+                    "trader_account_id": row.get("trader_account_id") or row.get("id"),
+                    "mt5_login": login,
+                    "reason": "invalid_login_or_server",
+                })
+                continue
+            expected[_dd_owner_shard(login, 4)] += 1
+
+        ready = (len(rejected) == 0 and len(invalid) == 0 and len(out) > 0)
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "dd_feed_source": "monitoring_registry",
+            "registry_dd_population": len(out),
+            "expected_shard_counts": {
+                "shard_1": expected[1],
+                "shard_2": expected[2],
+                "shard_3": expected[3],
+                "shard_4": expected[4],
+            },
+            "expected_total": sum(expected.values()),
+            "rejected_registry_count": len(rejected),
+            "invalid_routing_count": len(invalid),
+            "rejected_registry": rejected[:100],
+            "invalid_routing": invalid[:100],
+            "dd_registry_feed_ready": ready,
+        }, "DD registry coverage health")
+    except Exception as e:
         return bad(e, 500)
 
 
