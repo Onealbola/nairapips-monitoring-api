@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V26_REGISTRY_HEALTH_BULK_SCHEMA_SAFE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V27_AUTO_RETIRE_TERMINAL_REGISTRY_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -1048,6 +1048,22 @@ def apply_intelligence(account, snapshot):
     if not account_write_ok:
         print(f"CRITICAL SNAPSHOT ACCOUNT WRITE FAILED mt5={account.get('mt5_login')} account_id={account.get('id')}", flush=True)
 
+    # V27 permanent registry handoff:
+    # once this exact account is successfully terminal (breach or pass), remove
+    # it from the live registry immediately. Historical trader_accounts data stays.
+    if account_write_ok and (breached or target_hit):
+        persisted_status_v27 = str((persisted_account or {}).get("account_status") or "").lower()
+        terminal_v27 = (
+            persisted_status_v27.startswith("breached")
+            or persisted_status_v27.startswith("archived")
+            or persisted_status_v27.startswith("passed")
+        )
+        if terminal_v27:
+            _retire_registry_exact(
+                account.get("id"),
+                "breach_completed" if breached else f"{stage}_passed",
+            )
+
     trader_update = {
         "equity": equity,
         "balance": current_balance,
@@ -2062,6 +2078,39 @@ def _fast_monitorable_feed():
 
 
 
+
+def _retire_registry_exact(account_id, reason, successor_account_id=None):
+    """Idempotently retire one exact MT5 instance from the Monitoring Registry.
+
+    Lifecycle remains authoritative. This helper is called only AFTER the exact
+    trader_account terminal state has been successfully persisted.
+    """
+    if not account_id:
+        return False
+    try:
+        supabase.rpc("np_monitoring_retire", {
+            "p_trader_account_id": str(account_id),
+            "p_reason": str(reason or "lifecycle_terminal")[:500],
+            "p_successor_account_id": (
+                str(successor_account_id) if successor_account_id else None
+            ),
+        }).execute()
+        print(
+            f"REGISTRY RETIRED account_id={account_id} reason={reason}",
+            flush=True,
+        )
+        return True
+    except Exception as exc:
+        # Do not undo the lifecycle terminal write. The health/reconciliation
+        # endpoint will expose any failed registry retirement for retry.
+        print(
+            f"REGISTRY RETIRE RETRY REQUIRED account_id={account_id} "
+            f"reason={reason} error={repr(exc)}",
+            flush=True,
+        )
+        return False
+
+
 def _monitoring_registry_rows():
     """Exact precomputed work roster.
 
@@ -2468,7 +2517,26 @@ def disable_mt5_access():
     persisted_status = str((persisted or {}).get("account_status") or "").lower()
     if not account_write_ok or persisted_status != str(expected_status).lower():
         return bad(f"MT5 lock persistence failed: account_write_ok={account_write_ok}, mode={write_mode}, persisted_status={persisted_status}, expected={expected_status}", 500)
-    return ok({"account_id": account.get("id"), "status": status, "persisted_account_status": persisted_status, "persisted_balance": (persisted or {}).get("current_balance"), "persisted_equity": (persisted or {}).get("current_equity"), "account_write_mode": write_mode, "trader_write_ok": trader_write_ok}, "access disabled and verified")
+
+    # V27: exact terminal account leaves the live Monitoring Registry immediately.
+    # This makes the production handoff structural instead of requiring later cleanup.
+    registry_retired = _retire_registry_exact(
+        account.get("id"),
+        "breach_completed" if "breach" in status else (
+            f"{status}_completed" if status in pass_status_map else f"terminal_{status}"
+        ),
+    )
+
+    return ok({
+        "account_id": account.get("id"),
+        "status": status,
+        "persisted_account_status": persisted_status,
+        "persisted_balance": (persisted or {}).get("current_balance"),
+        "persisted_equity": (persisted or {}).get("current_equity"),
+        "account_write_mode": write_mode,
+        "trader_write_ok": trader_write_ok,
+        "registry_retired": registry_retired,
+    }, "access disabled, verified and registry retired")
 
 
 
