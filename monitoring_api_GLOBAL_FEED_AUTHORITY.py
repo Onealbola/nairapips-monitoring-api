@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V23_REGISTRY_READ_FIX_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V24_REGISTRY_RPC_READ_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2071,17 +2071,16 @@ def _monitoring_registry_rows():
     # V23: fetch active registry rows first, then filter state in Python.
     # This removes any dependency on PostgREST IN-filter behaviour/casing and
     # gives us a direct read of the actual Supabase registry population.
-    raw_registry = (
-        supabase.table("monitoring_registry")
-        .select("*")
-        .eq("active", True)
-        .order("activated_at", desc=False)
-        .limit(5000)
-        .execute().data or []
+    # V24: registry is read through a SECURITY DEFINER RPC because RLS is enabled
+    # on monitoring_registry. This avoids exposing the table directly while keeping
+    # the server-side monitoring API able to read the exact live roster.
+    registry = (
+        supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
     )
     registry = [
-        r for r in raw_registry
-        if str(r.get("monitoring_state") or "").strip().upper() in {"LIVE", "WATCHDOG"}
+        r for r in registry
+        if bool_true(r.get("active"))
+        and str(r.get("monitoring_state") or "").strip().upper() in {"LIVE", "WATCHDOG"}
     ]
     if not registry:
         return [], []
@@ -2192,11 +2191,7 @@ def monitoring_registry_raw_health():
     """Direct database read of the registry before trader-account revalidation."""
     try:
         rows = (
-            supabase.table("monitoring_registry")
-            .select("trader_account_id,mt5_login,monitoring_state,active,activated_at,updated_at")
-            .order("updated_at", desc=True)
-            .limit(5000)
-            .execute().data or []
+            supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
         )
         active_rows = [r for r in rows if bool_true(r.get("active"))]
         live_rows = [
