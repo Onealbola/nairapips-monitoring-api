@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V29_DD_REGISTRY_AUTHORITY_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V30_PROFIT_PROTECTED_WATCHDOG_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -83,7 +83,7 @@ def valid_login(v):
     return bool(v and v.isdigit() and not any(x in v.upper() for x in ["NEW", "LOGIN", "NONE", "NULL"]))
 
 
-ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active", "funded_profit_cap_reached"}
+ACTIVE_ACCOUNT_STATUSES = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live_active", "live", "funded", "approved_active", "funded_profit_cap_reached", "profit_protected"}
 TERMINAL_ACCOUNT_WORDS = ("archived", "breached", "closed", "locked", "disabled", "passed", "reset")
 PURCHASE_BLOCK_WORDS = ("waiting", "reset", "archived", "breached", "disabled", "closed", "cancelled", "canceled", "rejected", "passed_review")
 POOL_ACTIVE_STATUSES = {"assigned", "active", "in_use", "used", "allocated", "assigned_active"}
@@ -123,13 +123,16 @@ def bool_true(value):
 
 
 def is_funded_cap_lock(row):
-    """15% funded cap is a live financial lock, not a terminal lifecycle state.
+    """Funded financial lock states are LIVE/WATCHDOG, not terminal.
 
-    The account must remain in the monitoring feed so the watchdog can continue
-    enforcing no-further-trading while payout is outstanding.
+    - funded_profit_cap_reached: 15% funded cycle-cap lock
+    - profit_protected: exact funded payout-request lock
+
+    Both must remain visible to monitoring so the watchdog can enforce
+    no-further-trading while the payout/cap cycle is outstanding.
     """
     status = str((row or {}).get("account_status") or (row or {}).get("status") or "").strip().lower()
-    return status == "funded_profit_cap_reached"
+    return status in {"funded_profit_cap_reached", "profit_protected"}
 
 
 def lifecycle_blob(row, keys):
