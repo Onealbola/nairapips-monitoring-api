@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V18_STALE_MT5_FEED_QUARANTINE_2026_10_01"
+NAIRAPIPS_MONITORING_RELEASE = "V19_ALL_ACTIVE_PAGINATED_FEED_2026_10_02"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -1849,27 +1849,64 @@ def retire_old_terminal_accounts():
         print("TERMINAL RETIREMENT ERROR:", e, flush=True)
         return 0
 
+def _np_fetch_all_active_monitoring_accounts():
+    """Fetch the complete active MT5 population with stable pagination.
+
+    The previous discovery query used one `.limit(MONITORABLE_LIMIT)` call.
+    Once the active trader_accounts population reached that cap, any active rows
+    outside the first response were invisible to the Windows MT5 engine and their
+    dashboard metrics remained frozen.
+
+    Pagination is ordered by immutable account id so concurrent metric updates do
+    not reshuffle rows between pages. This is READ ONLY and does not modify any
+    assignment/lifecycle/Second-Life/reset/payout automation.
+    """
+    page_size = min(max(int(MONITORABLE_LIMIT or 1000), 100), 1000)
+    max_rows = int(os.getenv("NAIRAPIPS_MONITORABLE_MAX_ROWS", "20000") or "20000")
+    rows = []
+    seen = set()
+    offset = 0
+    while offset < max_rows:
+        batch = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
+            .order("id", desc=False)
+            .range(offset, min(offset + page_size - 1, max_rows - 1))
+            .execute()
+            .data
+            or []
+        )
+        if not batch:
+            break
+        for row in batch:
+            key = str((row or {}).get("id") or "").strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            rows.append(row)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    if offset >= max_rows and len(rows) >= max_rows:
+        print(
+            "CRITICAL MONITORABLE FEED SAFETY CAP REACHED:",
+            {"max_rows": max_rows, "returned": len(rows)},
+            flush=True,
+        )
+    return rows
+
+
 def _fast_monitorable_feed():
     """Production-critical MT5 discovery path.
 
-    Maximum normal DB work:
-      1 trader_accounts query
-      1 challenge_purchases bulk query
-      1 mt5_pool bulk query
-      1 traders bulk query
-      1 challenge_plans bulk query
-
-    No per-account queries. No monitoring_events writes. No lifecycle reconciliation.
+    Active trader_accounts are fetched with bounded stable pagination so no live
+    account disappears merely because the table contains more than one API page.
+    The remaining purchase/pool/trader/plan lookups stay bulk-only; there are no
+    per-account monitoring-event writes and no lifecycle reconciliation here.
     """
-    rows = (
-        supabase.table("trader_accounts")
-        .select("*")
-        .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
-        .limit(MONITORABLE_LIMIT)
-        .execute()
-        .data
-        or []
-    )
+    rows = _np_fetch_all_active_monitoring_accounts()
 
     # V18 STALE MT5 FEED QUARANTINE (read-only / reversible).
     # Business evidence: current NairaPips allocation series is 4772... and newer;
@@ -2630,18 +2667,61 @@ def trader_current_account_compat(lookup):
         return bad(e, 500)
 
 
-@app.route("/account_intelligence_scan")
-def account_intelligence_scan():
+@app.route("/monitoring_account_diagnostic", methods=["GET"])
+def monitoring_account_diagnostic():
+    """Read-only explanation of why one MT5 is or is not in the live engine feed."""
+    login = clean_login(request.args.get("mt5_login"))
+    if not login:
+        return bad("mt5_login is required", 400)
     try:
         rows = (
             supabase.table("trader_accounts")
             .select("*")
-            .in_("account_status", sorted(ACTIVE_ACCOUNT_STATUSES))
-            .limit(MONITORABLE_LIMIT)
-            .execute()
-            .data
-            or []
+            .eq("mt5_login", login)
+            .order("updated_at", desc=True)
+            .limit(20)
+            .execute().data or []
         )
+        active_rows = _np_fetch_all_active_monitoring_accounts()
+        active_same_login = [r for r in active_rows if clean_login(r.get("mt5_login")) == login]
+        feed = _fast_monitorable_feed()
+        in_feed = [r for r in feed if clean_login(r.get("mt5_login")) == login]
+        reasons = []
+        for r in rows:
+            why = []
+            if not is_active_monitoring_account(r): why.append("account_not_active_for_monitoring")
+            if not str(r.get("mt5_server") or "").strip(): why.append("missing_mt5_server")
+            if bool_false(r.get("monitoring_enabled")): why.append("monitoring_enabled_false")
+            if bool_true(r.get("mt5_access_disabled")) and not is_funded_cap_lock(r): why.append("mt5_access_disabled")
+            if r.get("superseded_at") or r.get("replaced_at") or bool_true(r.get("superseded")): why.append("superseded_or_replaced")
+            reasons.append({
+                "id": r.get("id"),
+                "account_status": r.get("account_status"),
+                "stage": r.get("stage"),
+                "last_sync_at": r.get("last_sync_at"),
+                "updated_at": r.get("updated_at"),
+                "current_balance": r.get("current_balance"),
+                "current_equity": r.get("current_equity"),
+                "eligible_before_ambiguity_check": len(why) == 0,
+                "reasons": why,
+            })
+        return ok({
+            "mt5_login": login,
+            "database_rows": len(rows),
+            "active_status_rows": len(active_same_login),
+            "live_feed_rows": len(in_feed),
+            "duplicate_active_login": len(active_same_login) > 1,
+            "rows": reasons,
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+        }, "monitoring account diagnostic")
+    except Exception as e:
+        return bad(e, 500)
+
+
+@app.route("/account_intelligence_scan")
+def account_intelligence_scan():
+    try:
+        rows = _np_fetch_all_active_monitoring_accounts()
         rows = eligible_accounts_without_login_ambiguity(rows, "account_intelligence_scan")
         results = []
         for account in rows:
