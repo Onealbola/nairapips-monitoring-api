@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "NAIRAPIPS_MONITORING_API_V17_BREACH_CONSTRAINT_COMPAT_2026_10_01"
+NAIRAPIPS_MONITORING_RELEASE = "V22_REGISTRY_SHADOW_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V19_ALL_ACTIVE_PAGINATED_FEED_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V21_FULL_COVERAGE_AUTHORITY_2026_10_02"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -97,12 +97,18 @@ def is_active_monitoring_account(row):
         return False
     if any(word in status for word in TERMINAL_ACCOUNT_WORDS):
         return False
-    # A verified breach is an irreversible lifecycle event for this exact account row.
-    # Removing a reversible lock or seeing a later recovered balance must never resurrect it.
-    if (row or {}).get("breached_at"):
+
+    # V21 authoritative terminal evidence only.
+    # Never cut a live account because of age, MT5-number series, a rounded/stale
+    # risk-zone label, or a mutable purchase/pool mirror.
+    if (row or {}).get("breach_at") or (row or {}).get("breached_at"):
         return False
     if (row or {}).get("archived_at") or (row or {}).get("reset_at"):
         return False
+    if (row or {}).get("superseded_at") or (row or {}).get("replaced_at") or bool_true((row or {}).get("superseded")):
+        return False
+
+    # Funded 15% cap remains live/watchdog-monitorable even while broker access is disabled.
     if str((row or {}).get("mt5_access_disabled") or "").lower() in {"true", "1", "yes"} and not is_funded_cap_lock(row):
         return False
     return valid_login((row or {}).get("mt5_login"))
@@ -592,6 +598,15 @@ def static_dd(start_balance, equity):
     return round(max(((start - eq) / start) * 100, 0.0), 2)
 
 
+def static_dd_precise(start_balance, equity):
+    """Full-precision DD for lifecycle/risk decisions; rounded DD is display-only."""
+    start = num(start_balance)
+    eq = num(equity)
+    if start <= 0:
+        return 0.0
+    return max(((start - eq) / start) * 100, 0.0)
+
+
 def dd_used_from_static(dd_percent, dd_limit_percent=None):
     limit = num(dd_limit_percent, MAX_DD_PERCENT or 20)
     if limit <= 0:
@@ -896,12 +911,14 @@ def apply_intelligence(account, snapshot):
     low_candidates = [x for x in [start, equity, old_low, snap_low] if x and x > 0]
     lowest = round(min(low_candidates), 2) if low_candidates else equity
 
-    current_dd = static_dd(start, equity)
-    current_dd_used = dd_used_from_static(current_dd, dd_limit_percent) if dd_authority_present else 0.0
-    worst_dd = static_dd(start, lowest)
-    worst_dd_used = dd_used_from_static(worst_dd, dd_limit_percent) if dd_authority_present else 0.0
-    dd_remaining = round(max(dd_limit_percent - current_dd, 0), 2) if dd_authority_present else 0.0
-    zone = risk_zone(current_dd, dd_limit_percent) if dd_authority_present else "authority_missing"
+    current_dd_precise = static_dd_precise(start, equity)
+    current_dd = round(current_dd_precise, 2)
+    current_dd_used = dd_used_from_static(current_dd_precise, dd_limit_percent) if dd_authority_present else 0.0
+    worst_dd_precise = static_dd_precise(start, lowest)
+    worst_dd = round(worst_dd_precise, 2)
+    worst_dd_used = dd_used_from_static(worst_dd_precise, dd_limit_percent) if dd_authority_present else 0.0
+    dd_remaining = round(max(dd_limit_percent - current_dd_precise, 0), 2) if dd_authority_present else 0.0
+    zone = risk_zone(current_dd_precise, dd_limit_percent) if dd_authority_present else "authority_missing"
 
     # Current payout/closed profit follows the actual MT5 balance.
     # highest_equity remains pass-target evidence only.
@@ -921,7 +938,7 @@ def apply_intelligence(account, snapshot):
     breached_by_equity = bool(dd_authority_present and start and equity <= breach_level)
     breached_by_balance = bool(dd_authority_present and start and current_balance <= breach_level)
     breached_by_recorded_low = bool(dd_authority_present and start and lowest <= breach_level)
-    terminal_breach_recorded = bool(account.get("breached_at"))
+    terminal_breach_recorded = bool(account.get("breach_at") or account.get("breached_at"))
     breached = bool(terminal_breach_recorded or breached_by_equity or breached_by_balance or breached_by_recorded_low)
 
     status = str(account.get("account_status") or "assigned_active").lower()
@@ -1908,37 +1925,13 @@ def _fast_monitorable_feed():
     """
     rows = _np_fetch_all_active_monitoring_accounts()
 
-    # V18 STALE MT5 FEED QUARANTINE (read-only / reversible).
-    # Business evidence: current NairaPips allocation series is 4772... and newer;
-    # older login series are only quarantined when the account record itself is
-    # also at least 21 days old. This does NOT archive/delete/change lifecycle or
-    # monitoring_enabled. It only keeps stale historical credentials out of the
-    # high-speed DD population. A recent account is never excluded by login alone.
-    from datetime import datetime, timezone, timedelta
-    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=21)
+    # V21: no MT5-number/age heuristic quarantine.
+    # Exclude only by authoritative lifecycle/ownership evidence.
     stale_quarantined = []
-
-    def _v18_stale_feed_candidate(a):
-        login = clean_login((a or {}).get("mt5_login"))
-        try:
-            login_n = int(login)
-        except Exception:
-            return False
-        # Current allocation series starts at 4772...; historical lower series
-        # must additionally prove age >=21d before feed-only quarantine.
-        if login_n >= 477200000:
-            return False
-        created = _parse_iso_dt((a or {}).get("created_at") or (a or {}).get("started_at"))
-        if created is None:
-            return False  # fail closed: unknown age stays protected
-        return created <= stale_cutoff
 
     # Cheapest account-level safety first.
     base = []
     for a in rows:
-        if _v18_stale_feed_candidate(a):
-            stale_quarantined.append(clean_login(a.get("mt5_login")))
-            continue
         if not is_active_monitoring_account(a):
             continue
         if not str(a.get("mt5_server") or "").strip():
@@ -2019,8 +2012,15 @@ def _fast_monitorable_feed():
             "status": "active",
             "account_status": a.get("account_status") or "assigned_active",
             "payment_status": "approved",
-            "monitoring_enabled": True,
-            "mt5_access_disabled": False,
+            "monitoring_enabled": not bool_false(a.get("monitoring_enabled")),
+            "mt5_access_disabled": bool_true(a.get("mt5_access_disabled")),
+            "breach_at": a.get("breach_at"),
+            "breached_at": a.get("breached_at"),
+            "archived_at": a.get("archived_at"),
+            "reset_at": a.get("reset_at"),
+            "superseded_at": a.get("superseded_at"),
+            "replaced_at": a.get("replaced_at"),
+            "superseded": a.get("superseded"),
             "mt5_login": clean_login(a.get("mt5_login")),
             "mt5_server": a.get("mt5_server") or "",
             "mt5_master_password": a.get("mt5_master_password") or a.get("mt5_password") or a.get("master_password") or "",
@@ -2059,6 +2059,189 @@ def _fast_monitorable_feed():
         flush=True,
     )
     return out
+
+
+
+def _monitoring_registry_rows():
+    """Exact precomputed work roster.
+
+    Registry rows are revalidated against trader_accounts so a stale registry row
+    can NEVER resurrect a terminal/replaced MT5 after a lifecycle write.
+    """
+    registry = (
+        supabase.table("monitoring_registry")
+        .select("*")
+        .eq("active", True)
+        .in_("monitoring_state", ["LIVE", "WATCHDOG"])
+        .order("activated_at", desc=False)
+        .limit(5000)
+        .execute().data or []
+    )
+    if not registry:
+        return [], []
+
+    account_map = _bulk_rows(
+        "trader_accounts",
+        [r.get("trader_account_id") for r in registry],
+    )
+
+    live = []
+    rejected = []
+    for reg in registry:
+        aid = str(reg.get("trader_account_id") or "").strip()
+        account = account_map.get(aid) or {}
+        if not account:
+            rejected.append({"trader_account_id": aid, "mt5_login": reg.get("mt5_login"), "reason": "account_missing"})
+            continue
+
+        # Re-use the conservative exact-account law. Registry does not override lifecycle.
+        if not is_active_monitoring_account(account):
+            rejected.append({"trader_account_id": aid, "mt5_login": reg.get("mt5_login"), "reason": "source_account_terminal"})
+            continue
+        if bool_false(account.get("monitoring_enabled")):
+            rejected.append({"trader_account_id": aid, "mt5_login": reg.get("mt5_login"), "reason": "monitoring_disabled"})
+            continue
+        if not str(account.get("mt5_server") or "").strip():
+            rejected.append({"trader_account_id": aid, "mt5_login": reg.get("mt5_login"), "reason": "missing_server"})
+            continue
+
+        # Build the same contract the current engine already understands.
+        trows = (
+            supabase.table("traders").select("id,name,full_name,email,phone,phase")
+            .eq("id", account.get("trader_id")).limit(1).execute().data or []
+        )
+        trader = trows[0] if trows else {}
+        purchase = {}
+        if account.get("purchase_id"):
+            prows = (
+                supabase.table("challenge_purchases").select("*")
+                .eq("id", account.get("purchase_id")).limit(1).execute().data or []
+            )
+            purchase = prows[0] if prows else {}
+
+        rule_values = _fast_rule_values(account, purchase, {})
+        live.append({
+            "id": account.get("id"),
+            "trader_id": account.get("trader_id"),
+            "trader_account_id": account.get("id"),
+            "current_account_id": account.get("id"),
+            "name": trader.get("name") or trader.get("full_name") or "Trader",
+            "full_name": trader.get("full_name") or trader.get("name") or "Trader",
+            "email": trader.get("email") or account.get("email"),
+            "phone": trader.get("phone") or "",
+            "phase": account.get("stage") or trader.get("phase") or "phase1",
+            "stage": account.get("stage") or trader.get("phase") or "phase1",
+            "status": "active",
+            "account_status": account.get("account_status") or "assigned_active",
+            "payment_status": "approved",
+            "monitoring_enabled": True,
+            "mt5_access_disabled": bool_true(account.get("mt5_access_disabled")),
+            "mt5_login": clean_login(account.get("mt5_login")),
+            "mt5_server": account.get("mt5_server") or "",
+            "mt5_master_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
+            "mt5_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
+            "master_password": account.get("mt5_master_password") or account.get("mt5_password") or account.get("master_password") or "",
+            "mt5_investor_password": account.get("mt5_investor_password") or account.get("investor_password") or "",
+            "investor_password": account.get("mt5_investor_password") or account.get("investor_password") or "",
+            "account_size": num(account.get("account_size") or account.get("start_balance")),
+            "dd_limit_percent": rule_values["dd_limit_percent"],
+            "dd_authority_present": rule_values["dd_authority_present"],
+            "dd_authority_source": rule_values.get("dd_authority_source") or "authority_missing",
+            "target_percent": rule_values["target_percent"],
+            "target_authority_present": rule_values["target_authority_present"],
+            "target_authority_source": rule_values.get("target_authority_source") or "authority_missing",
+            "balance": num(account.get("current_balance") or account.get("start_balance") or account.get("account_size")),
+            "current_balance": num(account.get("current_balance") or account.get("start_balance") or account.get("account_size")),
+            "equity": num(account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size")),
+            "current_equity": num(account.get("current_equity") or account.get("current_balance") or account.get("start_balance") or account.get("account_size")),
+            "highest_equity": num(account.get("highest_equity") or account.get("current_equity") or account.get("start_balance") or account.get("account_size")),
+            "lowest_equity": num(account.get("lowest_equity") or account.get("start_balance") or account.get("account_size")),
+            "profit_percent": num(account.get("profit_percent")),
+            "risk_zone": account.get("risk_zone") or "safe",
+            "monitoring_state": reg.get("monitoring_state"),
+            "registry_version": reg.get("version"),
+            "_source_of_truth": "monitoring_registry",
+        })
+    return live, rejected
+
+
+@app.route("/monitoring_registry_accounts", methods=["GET"])
+def monitoring_registry_accounts():
+    """SHADOW endpoint. Not used by production engine until coverage is proven."""
+    try:
+        live, rejected = _monitoring_registry_rows()
+        return ok({
+            "accounts": live,
+            "count": len(live),
+            "rejected_registry_rows": rejected,
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+        }, f"{len(live)} registry account(s)")
+    except Exception as e:
+        return bad(e, 500)
+
+
+@app.route("/monitoring_registry_health", methods=["GET"])
+def monitoring_registry_health():
+    """Compare current production discovery with the new exact registry.
+
+    This is the cutover gate. Production should not switch to registry-only until
+    every legitimate active account is either in registry or explicitly explained.
+    """
+    try:
+        legacy = _fast_monitorable_feed()
+        registry, rejected = _monitoring_registry_rows()
+
+        legacy_by_id = {
+            str(r.get("trader_account_id") or r.get("id") or "").strip(): r
+            for r in legacy
+            if str(r.get("trader_account_id") or r.get("id") or "").strip()
+        }
+        registry_by_id = {
+            str(r.get("trader_account_id") or r.get("id") or "").strip(): r
+            for r in registry
+            if str(r.get("trader_account_id") or r.get("id") or "").strip()
+        }
+
+        missing_from_registry = []
+        for aid, row in legacy_by_id.items():
+            if aid not in registry_by_id:
+                missing_from_registry.append({
+                    "trader_account_id": aid,
+                    "mt5_login": row.get("mt5_login"),
+                    "stage": row.get("stage"),
+                    "account_status": row.get("account_status"),
+                    "risk_zone": row.get("risk_zone"),
+                    "reason": "legacy_feed_live_but_not_in_registry",
+                })
+
+        registry_only = []
+        for aid, row in registry_by_id.items():
+            if aid not in legacy_by_id:
+                registry_only.append({
+                    "trader_account_id": aid,
+                    "mt5_login": row.get("mt5_login"),
+                    "stage": row.get("stage"),
+                    "account_status": row.get("account_status"),
+                    "reason": "registry_live_but_not_in_legacy_feed",
+                })
+
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "legacy_feed_count": len(legacy_by_id),
+            "registry_live_count": len(registry_by_id),
+            "missing_from_registry_count": len(missing_from_registry),
+            "registry_only_count": len(registry_only),
+            "rejected_registry_count": len(rejected),
+            "missing_from_registry": missing_from_registry[:1000],
+            "registry_only": registry_only[:1000],
+            "rejected_registry": rejected[:1000],
+            "cutover_ready": (
+                len(missing_from_registry) == 0
+                and len(rejected) == 0
+            ),
+        }, "monitoring registry health")
+    except Exception as e:
+        return bad(e, 500)
 
 
 @app.route("/monitorable_accounts")
@@ -2690,6 +2873,9 @@ def monitoring_account_diagnostic():
         for r in rows:
             why = []
             if not is_active_monitoring_account(r): why.append("account_not_active_for_monitoring")
+            if r.get("breach_at") or r.get("breached_at"): why.append("confirmed_breach_timestamp")
+            if str(r.get("risk_zone") or "").strip().lower() == "breached" and not (r.get("breach_at") or r.get("breached_at")):
+                why.append("stale_or_unconfirmed_breached_label_does_not_block_monitoring")
             if not str(r.get("mt5_server") or "").strip(): why.append("missing_mt5_server")
             if bool_false(r.get("monitoring_enabled")): why.append("monitoring_enabled_false")
             if bool_true(r.get("mt5_access_disabled")) and not is_funded_cap_lock(r): why.append("mt5_access_disabled")
@@ -2714,6 +2900,45 @@ def monitoring_account_diagnostic():
             "rows": reasons,
             "release": NAIRAPIPS_MONITORING_RELEASE,
         }, "monitoring account diagnostic")
+    except Exception as e:
+        return bad(e, 500)
+
+
+@app.route("/monitoring_coverage_health", methods=["GET"])
+def monitoring_coverage_health():
+    """Read-only proof that every active DB account is either in the live feed or explicitly excluded."""
+    try:
+        rows = _np_fetch_all_active_monitoring_accounts()
+        feed = _fast_monitorable_feed()
+        feed_ids = {str(r.get("trader_account_id") or r.get("id") or "").strip() for r in feed if str(r.get("trader_account_id") or r.get("id") or "").strip()}
+        excluded = []
+        for a in rows:
+            aid = str(a.get("id") or "").strip()
+            if aid in feed_ids:
+                continue
+            why = []
+            if not is_active_monitoring_account(a): why.append("not_active_or_confirmed_terminal")
+            if not str(a.get("mt5_server") or "").strip(): why.append("missing_mt5_server")
+            if bool_false(a.get("monitoring_enabled")): why.append("monitoring_enabled_false")
+            if bool_true(a.get("mt5_access_disabled")) and not is_funded_cap_lock(a): why.append("mt5_access_disabled")
+            if a.get("superseded_at") or a.get("replaced_at") or bool_true(a.get("superseded")): why.append("superseded_or_replaced")
+            excluded.append({
+                "trader_account_id": aid,
+                "mt5_login": clean_login(a.get("mt5_login")),
+                "stage": a.get("stage"),
+                "account_status": a.get("account_status"),
+                "risk_zone": a.get("risk_zone"),
+                "last_sync_at": a.get("last_sync_at"),
+                "reasons": why or ["ownership_or_duplicate_guard"],
+            })
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "active_db_rows": len(rows),
+            "live_feed_rows": len(feed),
+            "excluded_rows": len(excluded),
+            "coverage_percent": round((len(feed) / len(rows) * 100.0), 2) if rows else 100.0,
+            "excluded": excluded[:1000],
+        }, "monitoring coverage health")
     except Exception as e:
         return bad(e, 500)
 
