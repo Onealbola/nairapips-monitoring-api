@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V31_CANONICAL_MT5_ACCOUNT_RESOLVER_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V33_STRICT_EXCHANGE_LINEAGE_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2116,27 +2116,97 @@ def _retire_registry_exact(account_id, reason, successor_account_id=None):
         return False
 
 
-def _monitoring_registry_rows():
-    """Exact precomputed work roster with canonical MT5 lifecycle resolution.
 
-    Registry rows are still authoritative for which MT5 logins are in the work
-    roster, but a stale/duplicated trader_account_id is not allowed to discard a
-    legitimate current MT5.
+def _confirmed_terminal_source(row):
+    """Authoritative terminal latch for one MT5 lifecycle instance.
 
-    Canonical fallback is deliberately narrow:
-      * same MT5 login
-      * same trader
-      * same purchase when known
-      * source row must itself satisfy active/watchdog lifecycle law
-      * monitoring_enabled must not be explicitly false
-      * server must exist
+    Once a real breach/pass/reset/replacement/supersession is persisted, that MT5
+    instance must never re-enter DD policing merely because current equity later
+    recovers or because a stale duplicate row looks active.
 
-    This is specifically designed for legacy duplicate trader_accounts rows.
-    It does NOT merge different traders, purchases, or MT5 logins.
+    Financial watchdog locks are NOT terminal unless a real breach/pass/reset/
+    replacement marker also exists.
     """
-    registry = (
-        supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
-    )
+    if not row:
+        return False, None
+
+    status = str(row.get("account_status") or row.get("status") or "").strip().lower()
+    stage = str(row.get("stage") or row.get("phase") or "").strip().lower()
+
+    # Hard persisted lifecycle evidence wins permanently.
+    for key, reason in (
+        ("breach_at", "breach_at"),
+        ("breached_at", "breached_at"),
+        ("passed_at", "passed_at"),
+        ("reset_at", "reset_at"),
+        ("superseded_at", "superseded_at"),
+        ("replaced_at", "replaced_at"),
+    ):
+        if row.get(key):
+            return True, reason
+
+    if row.get("superseded") is True:
+        return True, "superseded"
+
+    # Archived rows are terminal unless they are an explicit live financial lock.
+    if row.get("archived_at") and not is_funded_cap_lock(row):
+        return True, "archived_at"
+
+    terminal_words = ("archived", "breached", "closed", "disabled", "passed", "reset", "replaced", "superseded")
+    blob = f"{status} {stage}"
+    if any(word in blob for word in terminal_words) and not is_funded_cap_lock(row):
+        return True, f"terminal_status:{status or stage}"
+
+    return False, None
+
+
+def _retire_registry_row(reg, reason):
+    """Best-effort retirement of one confirmed-terminal registry row."""
+    try:
+        q = (
+            supabase.table("monitoring_registry")
+            .update({
+                "active": False,
+                "monitoring_state": "RETIRED",
+                "retirement_reason": f"auto_terminal_latch:{reason}",
+                "retired_at": now_iso(),
+                "updated_at": now_iso(),
+            })
+            .eq("trader_account_id", reg.get("trader_account_id"))
+            .eq("active", True)
+        )
+        q.execute()
+        return True
+    except Exception as exc:
+        print(
+            "REGISTRY AUTO-RETIRE FAILED:",
+            {
+                "trader_account_id": reg.get("trader_account_id"),
+                "mt5_login": reg.get("mt5_login"),
+                "reason": reason,
+                "error": repr(exc),
+            },
+            flush=True,
+        )
+        return False
+
+
+def _monitoring_registry_rows():
+    """STRICT EXCHANGE ROSTER.
+
+    The registry row itself must be the CURRENT lifecycle instance.
+    No same-login duplicate rebinding is allowed here.
+
+    Authority:
+      assignment/purchase pointer -> monitoring_registry -> DD Police
+
+    OLD parent rows are retired when:
+      * registry says they have a successor,
+      * the purchase points to another trader_account,
+      * exact source is terminal/disabled,
+      * or the exact source no longer satisfies live/watchdog law.
+    """
+    registry = supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
     registry = [
         r for r in registry
         if bool_true(r.get("active"))
@@ -2145,169 +2215,148 @@ def _monitoring_registry_rows():
     if not registry:
         return [], []
 
-    exact_account_map = _bulk_rows(
+    account_map = _bulk_rows(
         "trader_accounts",
         [r.get("trader_account_id") for r in registry],
-    )
-
-    # Load all trader_account rows for registry MT5 logins in bounded chunks.
-    by_login = {}
-    logins = sorted({
-        clean_login(r.get("mt5_login"))
-        for r in registry
-        if clean_login(r.get("mt5_login"))
-    })
-    for i in range(0, len(logins), 40):
-        chunk = logins[i:i+40]
-        try:
-            rows = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .in_("mt5_login", chunk)
-                .limit(5000)
-                .execute().data or []
-            )
-        except Exception as exc:
-            print("CANONICAL MT5 CANDIDATE READ FAILED:", repr(exc), flush=True)
-            rows = []
-        for row in rows:
-            login = clean_login(row.get("mt5_login"))
-            if login:
-                by_login.setdefault(login, []).append(row)
-
-    selected = {}
-    rejected = []
-    rebound_events = []
-
-    def _candidate_rank(row):
-        status = str(row.get("account_status") or "").strip().lower()
-        watchdog = 1 if status in {"funded_profit_cap_reached", "profit_protected"} else 0
-        enabled = 1 if not bool_false(row.get("monitoring_enabled")) else 0
-        updated = str(row.get("updated_at") or row.get("created_at") or "")
-        return (enabled, watchdog, updated)
-
-    for reg in registry:
-        rid = str(reg.get("trader_account_id") or "").strip()
-        login = clean_login(reg.get("mt5_login"))
-        exact = exact_account_map.get(rid) or {}
-
-        trader_id = str(
-            reg.get("trader_id")
-            or exact.get("trader_id")
-            or ""
-        ).strip()
-        purchase_id = str(
-            reg.get("purchase_id")
-            or exact.get("purchase_id")
-            or ""
-        ).strip()
-
-        def _usable(row):
-            if not row:
-                return False
-            if clean_login(row.get("mt5_login")) != login:
-                return False
-            if trader_id and str(row.get("trader_id") or "").strip() != trader_id:
-                return False
-            if purchase_id and str(row.get("purchase_id") or "").strip() != purchase_id:
-                return False
-            if not is_active_monitoring_account(row):
-                return False
-            if bool_false(row.get("monitoring_enabled")):
-                return False
-            if not str(row.get("mt5_server") or "").strip():
-                return False
-            return True
-
-        account = exact if _usable(exact) else None
-
-        if account is None:
-            candidates = [row for row in by_login.get(login, []) if _usable(row)]
-            candidates.sort(key=_candidate_rank, reverse=True)
-            account = candidates[0] if candidates else None
-
-        if account is None:
-            reason = "source_account_terminal"
-            if exact and bool_false(exact.get("monitoring_enabled")):
-                reason = "monitoring_disabled"
-            elif exact and not str(exact.get("mt5_server") or "").strip():
-                reason = "missing_server"
-            rejected.append({
-                "trader_account_id": rid,
-                "mt5_login": login or reg.get("mt5_login"),
-                "reason": reason,
-            })
-            continue
-
-        selected[id(reg)] = account
-        if str(account.get("id") or "").strip() != rid:
-            rebound_events.append({
-                "mt5_login": login,
-                "registry_trader_account_id": rid,
-                "canonical_trader_account_id": account.get("id"),
-                "trader_id": account.get("trader_id"),
-                "purchase_id": account.get("purchase_id"),
-                "account_status": account.get("account_status"),
-                "monitoring_enabled": account.get("monitoring_enabled"),
-                "reason": "same_mt5_same_trader_same_purchase_canonical_rebind",
-            })
-
-    chosen_accounts = list(selected.values())
-
-    trader_map = _bulk_rows(
-        "traders",
-        [a.get("trader_id") for a in chosen_accounts],
         select="*",
     )
     purchase_map = _bulk_rows(
         "challenge_purchases",
-        [a.get("purchase_id") for a in chosen_accounts],
+        [r.get("purchase_id") for r in registry],
+        select="*",
+    )
+    trader_map = _bulk_rows(
+        "traders",
+        [r.get("trader_id") for r in registry],
         select="*",
     )
     pool_map = _bulk_rows(
         "mt5_pool",
-        [a.get("mt5_pool_id") for a in chosen_accounts],
+        [r.get("mt5_pool_id") for r in registry],
         select="*",
     )
 
     live = []
+    rejected = []
+
+    def _retire(reg, reason, successor=None):
+        try:
+            payload = {
+                "active": False,
+                "monitoring_state": "RETIRED",
+                "retirement_reason": "strict_exchange:" + str(reason),
+                "retired_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+            if successor:
+                payload["successor_account_id"] = successor
+            (
+                supabase.table("monitoring_registry")
+                .update(payload)
+                .eq("trader_account_id", reg.get("trader_account_id"))
+                .eq("active", True)
+                .execute()
+            )
+        except Exception as exc:
+            print("STRICT EXCHANGE RETIRE FAILED:", repr(exc), flush=True)
+
     for reg in registry:
-        account = selected.get(id(reg))
+        rid = str(reg.get("trader_account_id") or "").strip()
+        account = account_map.get(rid) or {}
+        purchase_id = str(reg.get("purchase_id") or account.get("purchase_id") or "").strip()
+        trader_id = str(reg.get("trader_id") or account.get("trader_id") or "").strip()
+        purchase = purchase_map.get(purchase_id) or {}
+        trader = trader_map.get(trader_id) or {}
+        pool = pool_map.get(str(reg.get("mt5_pool_id") or account.get("mt5_pool_id") or "")) or {}
+
         if not account:
+            _retire(reg, "missing_exact_source")
+            rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": "missing_exact_source"})
             continue
 
-        trader = trader_map.get(str(account.get("trader_id") or "")) or {}
-        purchase = purchase_map.get(str(account.get("purchase_id") or "")) or {}
-        pool = pool_map.get(str(account.get("mt5_pool_id") or "")) or {}
+        successor = str(reg.get("successor_account_id") or "").strip()
+        if successor:
+            _retire(reg, "has_successor", successor)
+            rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": "parent_has_successor"})
+            continue
+
+        is_term, term_reason = _confirmed_terminal_source(account)
+        if is_term:
+            _retire(reg, term_reason or "terminal_exact_source")
+            rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": f"terminal_exact_source:{term_reason}"})
+            continue
+
+        # Purchase pointer is the journey-slot authority. If NEW exists, OLD is out.
+        if purchase_id:
+            current_id = str(purchase.get("trader_account_id") or "").strip()
+            if current_id and current_id != rid:
+                _retire(reg, "not_current_purchase_pointer", current_id)
+                rejected.append({
+                    "trader_account_id": rid,
+                    "mt5_login": reg.get("mt5_login"),
+                    "reason": "not_current_purchase_pointer",
+                    "successor_account_id": current_id,
+                })
+                continue
+        else:
+            # Legacy/manual account without purchase: trader.current_account_id is
+            # allowed as the explicit pointer. Do not use this rule for purchase-
+            # linked traders because they may own multiple independent purchases.
+            current_id = str(trader.get("current_account_id") or "").strip()
+            if current_id and current_id != rid:
+                _retire(reg, "not_current_trader_pointer", current_id)
+                rejected.append({
+                    "trader_account_id": rid,
+                    "mt5_login": reg.get("mt5_login"),
+                    "reason": "not_current_trader_pointer",
+                    "successor_account_id": current_id,
+                })
+                continue
+
+        if not is_active_monitoring_account(account):
+            _retire(reg, "exact_source_not_monitorable")
+            rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": "exact_source_not_monitorable"})
+            continue
+
+        if bool_false(account.get("monitoring_enabled")):
+            _retire(reg, "monitoring_disabled")
+            rejected.append({"trader_account_id": rid, "mt5_login": reg.get("mt5_login"), "reason": "monitoring_disabled"})
+            continue
 
         account_login = clean_login(account.get("mt5_login"))
         account_trader_id = str(account.get("trader_id") or "").strip()
         account_id = str(account.get("id") or "").strip()
 
+        if not account_login or not str(account.get("mt5_server") or "").strip():
+            rejected.append({"trader_account_id": rid, "mt5_login": account_login, "reason": "missing_login_or_server"})
+            continue
+
+        # Credentials may come from exact current account, exact linked pool, or
+        # exact current purchase only. Historical duplicate trader_account rows are
+        # intentionally excluded so a dead parent cannot resurrect itself.
+        credential_rows = [account]
+
         pool_ok = bool(pool)
         if pool_ok:
             pool_login = clean_login(pool.get("mt5_login"))
             pool_tid = str(pool.get("assigned_trader_id") or pool.get("trader_id") or "").strip()
-            pool_aid = str(pool.get("trader_account_id") or "").strip()
             if pool_login and pool_login != account_login:
                 pool_ok = False
             if pool_tid and account_trader_id and pool_tid != account_trader_id:
                 pool_ok = False
-            if pool_aid and account_id and pool_aid != account_id:
-                pool_ok = False
+        if pool_ok:
+            credential_rows.append(pool)
 
         purchase_ok = bool(purchase)
         if purchase_ok:
-            p_login = clean_login(purchase.get("mt5_login"))
             p_tid = str(purchase.get("trader_id") or "").strip()
             p_aid = str(purchase.get("trader_account_id") or "").strip()
-            if p_login and p_login != account_login:
-                purchase_ok = False
             if p_tid and account_trader_id and p_tid != account_trader_id:
                 purchase_ok = False
-            # Do not reject a legacy duplicated lifecycle row solely because the
-            # purchase pointer references another duplicate of the SAME MT5,
-            # trader and purchase. Credentials remain bounded by those identities.
+            if p_aid and p_aid != account_id:
+                purchase_ok = False
+        if purchase_ok:
+            credential_rows.append(purchase)
 
         def _unique_secret_values(rows, keys):
             out = []
@@ -2322,25 +2371,6 @@ def _monitoring_registry_rows():
                         out.append(value)
             return out
 
-        credential_rows = [account]
-        if pool_ok:
-            credential_rows.append(pool)
-        if purchase_ok:
-            credential_rows.append(purchase)
-
-        # Add credentials from same-identity duplicates only. This is what rescued
-        # stale credential cases without ever crossing trader/purchase/MT5 identity.
-        for candidate in by_login.get(account_login, []):
-            if (
-                str(candidate.get("trader_id") or "").strip() == account_trader_id
-                and (
-                    not str(account.get("purchase_id") or "").strip()
-                    or str(candidate.get("purchase_id") or "").strip()
-                       == str(account.get("purchase_id") or "").strip()
-                )
-            ):
-                credential_rows.append(candidate)
-
         investor_candidates = _unique_secret_values(
             credential_rows,
             ["mt5_investor_password", "investor_password", "investor"],
@@ -2351,22 +2381,20 @@ def _monitoring_registry_rows():
         )
 
         rule_values = _fast_rule_values(account, purchase, {})
-        registry_original_id = str(reg.get("trader_account_id") or "").strip()
-        rebound = registry_original_id != account_id
 
         live.append({
             "id": account_id,
             "trader_id": account.get("trader_id"),
             "trader_account_id": account_id,
             "current_account_id": account_id,
-            "registry_trader_account_id": registry_original_id,
-            "canonical_rebound": rebound,
+            "registry_trader_account_id": rid,
+            "canonical_rebound": False,
             "name": trader.get("name") or "Trader",
             "full_name": trader.get("name") or "Trader",
             "email": trader.get("email") or account.get("email"),
             "phone": trader.get("phone") or "",
-            "phase": account.get("stage") or account.get("phase") or trader.get("phase") or "phase1",
-            "stage": account.get("stage") or account.get("phase") or trader.get("phase") or "phase1",
+            "phase": account.get("stage") or account.get("phase") or "phase1",
+            "stage": account.get("stage") or account.get("phase") or "phase1",
             "status": "active",
             "account_status": account.get("account_status") or "assigned_active",
             "payment_status": "approved",
@@ -2404,18 +2432,33 @@ def _monitoring_registry_rows():
             "risk_zone": account.get("risk_zone") or "safe",
             "monitoring_state": reg.get("monitoring_state"),
             "registry_version": reg.get("version"),
-            "_source_of_truth": "monitoring_registry",
+            "_source_of_truth": "monitoring_registry_strict_exchange",
         })
-
-    if rebound_events:
-        print(
-            "CANONICAL MT5 REBINDS:",
-            {"count": len(rebound_events), "sample": rebound_events[:50]},
-            flush=True,
-        )
 
     return live, rejected
 
+
+
+@app.route("/monitoring_exchange_health", methods=["GET"])
+def monitoring_exchange_health():
+    """Read-only proof of OLD OUT / NEW IN enforcement."""
+    try:
+        live, rejected = _monitoring_registry_rows()
+        reasons = {}
+        for row in rejected:
+            reason = str(row.get("reason") or "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "strict_exchange_mode": True,
+            "live_current_instances": len(live),
+            "rejected_or_retired_this_read": len(rejected),
+            "rejection_reasons": reasons,
+            "sample_rejected": rejected[:100],
+            "exchange_feed_ready": len(live) > 0 and len(rejected) == 0,
+        }, "monitoring exchange health")
+    except Exception as e:
+        return bad(e, 500)
 
 
 @app.route("/monitoring_registry_canonical_health", methods=["GET"])
@@ -2441,6 +2484,7 @@ def monitoring_registry_canonical_health():
             "canonical_rebounds": rebound[:100],
             "rejected": rejected[:100],
             "canonical_feed_ready": len(live) > 0 and len(rejected) == 0,
+            "strict_exchange_mode": True,
         }, "monitoring registry canonical health")
     except Exception as e:
         return bad(e, 500)
