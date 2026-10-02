@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V33_STRICT_EXCHANGE_LINEAGE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V34_STRICT_EXCHANGE_MULTI_JOURNEY_SAFE_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2299,19 +2299,21 @@ def _monitoring_registry_rows():
                 })
                 continue
         else:
-            # Legacy/manual account without purchase: trader.current_account_id is
-            # allowed as the explicit pointer. Do not use this rule for purchase-
-            # linked traders because they may own multiple independent purchases.
-            current_id = str(trader.get("current_account_id") or "").strip()
-            if current_id and current_id != rid:
-                _retire(reg, "not_current_trader_pointer", current_id)
-                rejected.append({
-                    "trader_account_id": rid,
-                    "mt5_login": reg.get("mt5_login"),
-                    "reason": "not_current_trader_pointer",
-                    "successor_account_id": current_id,
-                })
-                continue
+            # V34 MULTI-JOURNEY SAFETY:
+            # A trader may legitimately own several simultaneous challenge/funded
+            # accounts. Therefore traders.current_account_id is NOT a valid global
+            # authority for a registry row that has no purchase_id.
+            #
+            # For legacy/manual rows without purchase linkage, keep the exact
+            # registry lifecycle instance only when:
+            #   - it has no successor,
+            #   - the exact trader_account row is still monitorable,
+            #   - it has no terminal latch,
+            #   - monitoring_enabled is not false.
+            #
+            # This avoids falsely ejecting legitimate parallel accounts merely
+            # because another account is the trader's dashboard "current" pointer.
+            pass
 
         if not is_active_monitoring_account(account):
             _retire(reg, "exact_source_not_monitorable")
@@ -2451,6 +2453,7 @@ def monitoring_exchange_health():
         return ok({
             "release": NAIRAPIPS_MONITORING_RELEASE,
             "strict_exchange_mode": True,
+            "multi_journey_safe": True,
             "live_current_instances": len(live),
             "rejected_or_retired_this_read": len(rejected),
             "rejection_reasons": reasons,
@@ -2485,6 +2488,7 @@ def monitoring_registry_canonical_health():
             "rejected": rejected[:100],
             "canonical_feed_ready": len(live) > 0 and len(rejected) == 0,
             "strict_exchange_mode": True,
+            "multi_journey_safe": True,
         }, "monitoring registry canonical health")
     except Exception as e:
         return bad(e, 500)
