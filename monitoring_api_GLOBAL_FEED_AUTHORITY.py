@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V22_REGISTRY_SHADOW_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V23_REGISTRY_READ_FIX_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
-NAIRAPIPS_MONITORING_RELEASE = "V21_FULL_COVERAGE_AUTHORITY_2026_10_02"
+# V23 removed duplicate NAIRAPIPS_MONITORING_RELEASE override
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -2068,15 +2068,21 @@ def _monitoring_registry_rows():
     Registry rows are revalidated against trader_accounts so a stale registry row
     can NEVER resurrect a terminal/replaced MT5 after a lifecycle write.
     """
-    registry = (
+    # V23: fetch active registry rows first, then filter state in Python.
+    # This removes any dependency on PostgREST IN-filter behaviour/casing and
+    # gives us a direct read of the actual Supabase registry population.
+    raw_registry = (
         supabase.table("monitoring_registry")
         .select("*")
         .eq("active", True)
-        .in_("monitoring_state", ["LIVE", "WATCHDOG"])
         .order("activated_at", desc=False)
         .limit(5000)
         .execute().data or []
     )
+    registry = [
+        r for r in raw_registry
+        if str(r.get("monitoring_state") or "").strip().upper() in {"LIVE", "WATCHDOG"}
+    ]
     if not registry:
         return [], []
 
@@ -2178,6 +2184,39 @@ def monitoring_registry_accounts():
         }, f"{len(live)} registry account(s)")
     except Exception as e:
         return bad(e, 500)
+
+
+
+@app.route("/monitoring_registry_raw_health", methods=["GET"])
+def monitoring_registry_raw_health():
+    """Direct database read of the registry before trader-account revalidation."""
+    try:
+        rows = (
+            supabase.table("monitoring_registry")
+            .select("trader_account_id,mt5_login,monitoring_state,active,activated_at,updated_at")
+            .order("updated_at", desc=True)
+            .limit(5000)
+            .execute().data or []
+        )
+        active_rows = [r for r in rows if bool_true(r.get("active"))]
+        live_rows = [
+            r for r in active_rows
+            if str(r.get("monitoring_state") or "").strip().upper() in {"LIVE", "WATCHDOG"}
+        ]
+        states = {}
+        for r in rows:
+            key = str(r.get("monitoring_state") or "NULL").strip() or "NULL"
+            states[key] = states.get(key, 0) + 1
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "raw_registry_total": len(rows),
+            "raw_registry_active": len(active_rows),
+            "raw_registry_live_watchdog": len(live_rows),
+            "states": states,
+            "sample": rows[:20],
+        }, "monitoring registry raw health")
+    except Exception as e:
+        return bad(f"monitoring_registry raw read failed: {repr(e)}", 500)
 
 
 @app.route("/monitoring_registry_health", methods=["GET"])
