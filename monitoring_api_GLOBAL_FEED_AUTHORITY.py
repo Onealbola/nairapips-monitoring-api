@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V25_REGISTRY_HEALTH_SCHEMA_SAFE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V26_REGISTRY_HEALTH_BULK_SCHEMA_SAFE_2026_10_02"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2090,6 +2090,19 @@ def _monitoring_registry_rows():
         [r.get("trader_account_id") for r in registry],
     )
 
+    # V26 schema-safe bulk mirrors. SELECT * avoids assuming optional columns such
+    # as traders.full_name or traders.phase exist in every production schema.
+    trader_map = _bulk_rows(
+        "traders",
+        [a.get("trader_id") for a in account_map.values()],
+        select="*",
+    )
+    purchase_map = _bulk_rows(
+        "challenge_purchases",
+        [a.get("purchase_id") for a in account_map.values()],
+        select="*",
+    )
+
     live = []
     rejected = []
     for reg in registry:
@@ -2111,20 +2124,8 @@ def _monitoring_registry_rows():
             continue
 
         # Build the same contract the current engine already understands.
-        # V25 schema-safe trader read:
-        # production traders table has no full_name column.
-        trows = (
-            supabase.table("traders").select("id,name,email,phone,phase")
-            .eq("id", account.get("trader_id")).limit(1).execute().data or []
-        )
-        trader = trows[0] if trows else {}
-        purchase = {}
-        if account.get("purchase_id"):
-            prows = (
-                supabase.table("challenge_purchases").select("*")
-                .eq("id", account.get("purchase_id")).limit(1).execute().data or []
-            )
-            purchase = prows[0] if prows else {}
+        trader = trader_map.get(str(account.get("trader_id") or "")) or {}
+        purchase = purchase_map.get(str(account.get("purchase_id") or "")) or {}
 
         rule_values = _fast_rule_values(account, purchase, {})
         live.append({
@@ -2136,8 +2137,8 @@ def _monitoring_registry_rows():
             "full_name": trader.get("name") or "Trader",
             "email": trader.get("email") or account.get("email"),
             "phone": trader.get("phone") or "",
-            "phase": account.get("stage") or trader.get("phase") or "phase1",
-            "stage": account.get("stage") or trader.get("phase") or "phase1",
+            "phase": account.get("stage") or account.get("phase") or trader.get("phase") or "phase1",
+            "stage": account.get("stage") or account.get("phase") or trader.get("phase") or "phase1",
             "status": "active",
             "account_status": account.get("account_status") or "assigned_active",
             "payment_status": "approved",
@@ -2277,6 +2278,7 @@ def monitoring_registry_health():
             ),
         }, "monitoring registry health")
     except Exception as e:
+        print("REGISTRY HEALTH ERROR:", repr(e), flush=True)
         return bad(e, 500)
 
 
