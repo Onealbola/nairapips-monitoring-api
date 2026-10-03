@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V41_DATABASE_BRIDGE_ROSTER_TOKEN_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V42_FINAL_ASSIGNMENT_WATCHDOG_INACTIVITY_FIX_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2798,12 +2798,24 @@ def _monitoring_registry_rows():
             })
             continue
 
-        # V36: 7 DAYS FROM ASSIGNMENT + NO TRADING ACTIVITY = INVALID.
-        # This works together with, not instead of, successor/terminal/current-proof
-        # rules. It removes unused historical ghosts even when no child exists.
-        expired_7d, inactivity_info = _seven_day_inactivity_status(
-            reg, account, purchase, pool
-        )
+        # V42 WATCHDOG LAW:
+        # funded_profit_cap_reached / profit_protected are financial lock states,
+        # not stale-unused accounts. They MUST remain in WATCHDOG indefinitely
+        # until payout/cycle resolution, even if there has been no trade for 7+ days.
+        # Applying the generic inactivity retirement here caused legitimate funded
+        # cap locks to oscillate LIVE -> RETIRED and created pointer gaps.
+        if is_funded_cap_lock(account):
+            expired_7d = False
+            inactivity_info = {
+                "rule_applied": False,
+                "reason": "financial_watchdog_lock_exempt_from_7day_retirement",
+            }
+        else:
+            # V36: 7 DAYS FROM ASSIGNMENT + NO TRADING ACTIVITY = INVALID.
+            # This applies only to ordinary live challenge/funded accounts.
+            expired_7d, inactivity_info = _seven_day_inactivity_status(
+                reg, account, purchase, pool
+            )
         if expired_7d:
             stale_row = {
                 "trader_account_id": rid,
@@ -3179,13 +3191,8 @@ def monitoring_registry_health():
 
 
 # ============================================================================
-# V41 — LIGHTWEIGHT ROSTER VERSION/TOKEN
+# V42 — LIGHTWEIGHT ROSTER TOKEN + POINTER-GAP HEALTH
 # ============================================================================
-# The VPS roster watcher polls this endpoint frequently.  It reads ONLY the
-# monitoring registry RPC and computes a stable token from membership/version.
-# It does not join lifecycle tables and does not run MT5 or DD logic.
-#
-# Full /monitorable_accounts is fetched only when this token changes.
 @app.route("/monitoring_roster_version", methods=["GET"])
 def monitoring_roster_version():
     try:
@@ -3212,10 +3219,7 @@ def monitoring_roster_version():
             "count": len(live),
         }, "monitoring roster version")
     except Exception as exc:
-        return bad({
-            "release": NAIRAPIPS_MONITORING_RELEASE,
-            "error": repr(exc),
-        }, 500)
+        return bad({"release": NAIRAPIPS_MONITORING_RELEASE, "error": repr(exc)}, 500)
 
 
 @app.route("/monitoring_pointer_gap_health", methods=["GET"])
@@ -3234,10 +3238,7 @@ def monitoring_pointer_gap_health():
             "healthy": len(rows) == 0,
         }, "monitoring pointer gap health")
     except Exception as exc:
-        return bad({
-            "release": NAIRAPIPS_MONITORING_RELEASE,
-            "error": repr(exc),
-        }, 500)
+        return bad({"release": NAIRAPIPS_MONITORING_RELEASE, "error": repr(exc)}, 500)
 
 
 @app.route("/monitorable_accounts")
