@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V39_ATOMIC_7DAY_RETIREMENT_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V41_DATABASE_BRIDGE_ROSTER_TOKEN_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -3176,6 +3176,68 @@ def monitoring_registry_health():
     except Exception as e:
         print("REGISTRY HEALTH ERROR:", repr(e), flush=True)
         return bad(e, 500)
+
+
+# ============================================================================
+# V41 — LIGHTWEIGHT ROSTER VERSION/TOKEN
+# ============================================================================
+# The VPS roster watcher polls this endpoint frequently.  It reads ONLY the
+# monitoring registry RPC and computes a stable token from membership/version.
+# It does not join lifecycle tables and does not run MT5 or DD logic.
+#
+# Full /monitorable_accounts is fetched only when this token changes.
+@app.route("/monitoring_roster_version", methods=["GET"])
+def monitoring_roster_version():
+    try:
+        import hashlib as _hashlib
+        rows = supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
+        live = [
+            r for r in rows
+            if bool_true(r.get("active"))
+            and str(r.get("monitoring_state") or "").strip().upper() in {"LIVE", "WATCHDOG"}
+        ]
+        parts = []
+        for r in live:
+            parts.append("|".join([
+                str(r.get("trader_account_id") or "").strip(),
+                str(r.get("mt5_login") or "").strip(),
+                str(r.get("monitoring_state") or "").strip().upper(),
+                str(r.get("version") or "0").strip(),
+            ]))
+        parts.sort()
+        token = _hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "token": token,
+            "count": len(live),
+        }, "monitoring roster version")
+    except Exception as exc:
+        return bad({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "error": repr(exc),
+        }, 500)
+
+
+@app.route("/monitoring_pointer_gap_health", methods=["GET"])
+def monitoring_pointer_gap_health():
+    try:
+        rows = (
+            supabase.table("np_monitoring_pointer_gap_health")
+            .select("*")
+            .limit(1000)
+            .execute().data or []
+        )
+        return ok({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "gap_count": len(rows),
+            "gaps": rows,
+            "healthy": len(rows) == 0,
+        }, "monitoring pointer gap health")
+    except Exception as exc:
+        return bad({
+            "release": NAIRAPIPS_MONITORING_RELEASE,
+            "error": repr(exc),
+        }, 500)
 
 
 @app.route("/monitorable_accounts")
