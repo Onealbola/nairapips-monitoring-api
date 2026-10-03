@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V35_POSITIVE_CURRENT_PROOF_GATE_2026_10_02"
+NAIRAPIPS_MONITORING_RELEASE = "V36_7DAY_INACTIVITY_GATE_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2192,6 +2192,8 @@ def _retire_registry_row(reg, reason):
 
 
 _LAST_CURRENT_PROOF_QUARANTINE = []
+_LAST_7DAY_INACTIVE_EXPIRED = []
+_LAST_7DAY_TRADE_HISTORY_AVAILABLE = True
 
 
 def _monitoring_registry_rows():
@@ -2320,9 +2322,66 @@ def _monitoring_registry_rows():
         and "bootstrap" not in str(ev.get("reason") or "").lower()
     }
 
+    # V36 7-DAY INACTIVITY RULE
+    # Business rule: an assigned MT5 that has NEVER traded within 7 days from
+    # assignment becomes invalid for the monitoring engine.
+    #
+    # trader_trades is the strongest activity ledger. We check both exact
+    # trader_account_id and MT5 login because some legacy rows were written
+    # before exact account linkage became mandatory.
+    traded_account_ids = set()
+    traded_logins = set()
+    trade_history_available = True
+
+    try:
+        if registry_account_ids:
+            rows = (
+                supabase.table("trader_trades")
+                .select("trader_account_id,mt5_login")
+                .in_("trader_account_id", registry_account_ids)
+                .limit(10000)
+                .execute().data or []
+            )
+            for tr in rows:
+                aid = str(tr.get("trader_account_id") or "").strip()
+                lg = clean_login(tr.get("mt5_login"))
+                if aid:
+                    traded_account_ids.add(aid)
+                if lg:
+                    traded_logins.add(lg)
+    except Exception as exc:
+        trade_history_available = False
+        print("V36 TRADE HISTORY ACCOUNT LOOKUP ERROR:", repr(exc), flush=True)
+
+    try:
+        registry_logins = sorted({
+            clean_login(r.get("mt5_login"))
+            for r in registry
+            if clean_login(r.get("mt5_login"))
+        })
+        if registry_logins:
+            rows = (
+                supabase.table("trader_trades")
+                .select("trader_account_id,mt5_login")
+                .in_("mt5_login", registry_logins)
+                .limit(10000)
+                .execute().data or []
+            )
+            for tr in rows:
+                aid = str(tr.get("trader_account_id") or "").strip()
+                lg = clean_login(tr.get("mt5_login"))
+                if aid:
+                    traded_account_ids.add(aid)
+                if lg:
+                    traded_logins.add(lg)
+    except Exception as exc:
+        trade_history_available = False
+        print("V36 TRADE HISTORY LOGIN LOOKUP ERROR:", repr(exc), flush=True)
+
     live = []
     rejected = []
     quarantined = []
+    stale_inactive = []
 
     def _retire(reg, reason, successor=None):
         try:
@@ -2403,6 +2462,121 @@ def _monitoring_registry_rows():
 
         return False, "no_positive_current_assignment_proof", purchase
 
+    def _parse_dt(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            # Supabase timestamps commonly end in Z or +00.
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _assignment_time(reg, account, purchase, pool):
+        # Strongest assignment-time authorities first.
+        candidates = [
+            ("account.assigned_at", (account or {}).get("assigned_at")),
+            ("account.started_at", (account or {}).get("started_at")),
+            ("pool.assigned_at", (pool or {}).get("assigned_at")),
+            ("purchase.assigned_at", (purchase or {}).get("assigned_at")),
+            ("account.created_at", (account or {}).get("created_at")),
+            ("registry.activated_at", (reg or {}).get("activated_at")),
+        ]
+        for source, value in candidates:
+            dt = _parse_dt(value)
+            if dt is not None:
+                return dt, source
+        return None, "assignment_time_missing"
+
+    def _account_has_activity(account):
+        rid = str((account or {}).get("id") or "").strip()
+        login = clean_login((account or {}).get("mt5_login"))
+        if rid in traded_account_ids or (login and login in traded_logins):
+            return True, "trader_trades"
+
+        # Legacy safety: a materially moved balance/equity is evidence the account
+        # has traded even if old trade-history rows were not linked correctly.
+        start = num(
+            (account or {}).get("start_balance")
+            or (account or {}).get("account_size")
+            or 0
+        )
+        values = [
+            num((account or {}).get("current_balance")),
+            num((account or {}).get("current_equity")),
+            num((account or {}).get("highest_equity")),
+            num((account or {}).get("lowest_equity")),
+        ]
+        if start > 0:
+            for value in values:
+                if value > 0 and abs(value - start) > max(1.0, start * 0.000001):
+                    return True, "financial_movement"
+
+        if abs(num((account or {}).get("profit"))) > 0.000001:
+            return True, "profit_movement"
+        if abs(num((account or {}).get("profit_percent"))) > 0.000001:
+            return True, "profit_percent_movement"
+
+        return False, "no_trade_activity"
+
+    def _seven_day_inactivity_status(reg, account, purchase, pool):
+        # If trade-history infrastructure itself is unavailable, do NOT falsely
+        # expire legitimate accounts. Other current-proof/terminal gates continue.
+        if not trade_history_available:
+            return False, {
+                "rule_applied": False,
+                "reason": "trade_history_unavailable",
+            }
+
+        has_activity, activity_source = _account_has_activity(account)
+        assigned_at, assignment_source = _assignment_time(reg, account, purchase, pool)
+
+        if has_activity:
+            return False, {
+                "rule_applied": True,
+                "activity_found": True,
+                "activity_source": activity_source,
+                "assignment_source": assignment_source,
+                "assigned_at": assigned_at.isoformat() if assigned_at else None,
+            }
+
+        if assigned_at is None:
+            # Missing assignment time is not enough to invent a 7-day expiry.
+            return False, {
+                "rule_applied": False,
+                "activity_found": False,
+                "reason": "assignment_time_missing",
+            }
+
+        age_seconds = (datetime.now(timezone.utc) - assigned_at).total_seconds()
+        age_days = age_seconds / 86400.0
+
+        if age_days >= 7.0:
+            return True, {
+                "rule_applied": True,
+                "activity_found": False,
+                "activity_source": activity_source,
+                "assignment_source": assignment_source,
+                "assigned_at": assigned_at.isoformat(),
+                "age_days": round(age_days, 3),
+                "reason": "stale_inactive_expired_7days",
+            }
+
+        return False, {
+            "rule_applied": True,
+            "activity_found": False,
+            "activity_source": activity_source,
+            "assignment_source": assignment_source,
+            "assigned_at": assigned_at.isoformat(),
+            "age_days": round(age_days, 3),
+            "reason": "within_7day_grace",
+        }
+
     for reg in registry:
         rid = str(reg.get("trader_account_id") or "").strip()
         account = account_map.get(rid) or {}
@@ -2454,6 +2628,23 @@ def _monitoring_registry_rows():
                     and str(pool.get("trader_account_id") or "").strip() == rid
                     and clean_login(pool.get("mt5_login")) == clean_login(account.get("mt5_login"))
                 ),
+            })
+            continue
+
+        # V36: 7 DAYS FROM ASSIGNMENT + NO TRADING ACTIVITY = INVALID.
+        # This works together with, not instead of, successor/terminal/current-proof
+        # rules. It removes unused historical ghosts even when no child exists.
+        expired_7d, inactivity_info = _seven_day_inactivity_status(
+            reg, account, purchase, pool
+        )
+        if expired_7d:
+            stale_inactive.append({
+                "trader_account_id": rid,
+                "trader_id": trader_id,
+                "mt5_login": account.get("mt5_login") or reg.get("mt5_login"),
+                "stage": account.get("stage") or account.get("phase"),
+                "account_status": account.get("account_status"),
+                **inactivity_info,
             })
             continue
 
@@ -2606,11 +2797,16 @@ def _monitoring_registry_rows():
             "monitoring_state": reg.get("monitoring_state"),
             "registry_version": reg.get("version"),
             "current_proof_source": proof_source,
-            "_source_of_truth": "monitoring_registry_positive_current_proof",
+            "seven_day_inactivity_rule": inactivity_info,
+            "_source_of_truth": "monitoring_registry_positive_current_proof_7day_gate",
         })
 
     global _LAST_CURRENT_PROOF_QUARANTINE
+    global _LAST_7DAY_INACTIVE_EXPIRED
+    global _LAST_7DAY_TRADE_HISTORY_AVAILABLE
     _LAST_CURRENT_PROOF_QUARANTINE = quarantined
+    _LAST_7DAY_INACTIVE_EXPIRED = stale_inactive
+    _LAST_7DAY_TRADE_HISTORY_AVAILABLE = trade_history_available
     return live, rejected
 
 
@@ -2630,6 +2826,10 @@ def monitoring_exchange_health():
             "multi_journey_safe": True,
             "live_current_instances": len(live),
             "positive_proof_gate": True,
+            "seven_day_inactivity_gate": True,
+            "seven_day_trade_history_available": _LAST_7DAY_TRADE_HISTORY_AVAILABLE,
+            "stale_inactive_expired_count": len(_LAST_7DAY_INACTIVE_EXPIRED),
+            "stale_inactive_expired": _LAST_7DAY_INACTIVE_EXPIRED[:100],
             "quarantined_unproven_count": len(_LAST_CURRENT_PROOF_QUARANTINE),
             "quarantined_unproven": _LAST_CURRENT_PROOF_QUARANTINE[:100],
             "rejected_or_retired_this_read": len(rejected),
@@ -2881,9 +3081,13 @@ def dd_registry_coverage_health():
         ready = (len(rejected) == 0 and len(invalid) == 0 and len(out) > 0)
         return ok({
             "release": NAIRAPIPS_MONITORING_RELEASE,
-            "dd_feed_source": "monitoring_registry_positive_current_proof",
+            "dd_feed_source": "monitoring_registry_positive_current_proof_7day_gate",
             "registry_dd_population": len(out),
             "positive_proof_gate": True,
+            "seven_day_inactivity_gate": True,
+            "seven_day_trade_history_available": _LAST_7DAY_TRADE_HISTORY_AVAILABLE,
+            "stale_inactive_expired_count": len(_LAST_7DAY_INACTIVE_EXPIRED),
+            "stale_inactive_expired": _LAST_7DAY_INACTIVE_EXPIRED[:100],
             "quarantined_unproven_count": len(_LAST_CURRENT_PROOF_QUARANTINE),
             "quarantined_unproven": _LAST_CURRENT_PROOF_QUARANTINE[:100],
             "expected_shard_counts": {
