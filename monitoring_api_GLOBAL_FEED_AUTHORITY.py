@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V36_7DAY_INACTIVITY_GATE_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V38_ROLLING_7DAY_INACTIVITY_AUTO_RETIRE_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2322,36 +2322,41 @@ def _monitoring_registry_rows():
         and "bootstrap" not in str(ev.get("reason") or "").lower()
     }
 
-    # V36 7-DAY INACTIVITY RULE
-    # Business rule: an assigned MT5 that has NEVER traded within 7 days from
-    # assignment becomes invalid for the monitoring engine.
+    # V38 ROLLING 7-DAY INACTIVITY RULE
+    # Business law:
+    #   - If the account has NEVER traded, count 7 days from assignment.
+    #   - If it HAS traded, count 7 consecutive days from the LAST trading activity.
+    #   - If any trade is currently OPEN, the account remains under DD monitoring
+    #     regardless of how old the position is.
     #
-    # trader_trades is the strongest activity ledger. We check both exact
-    # trader_account_id and MT5 login because some legacy rows were written
-    # before exact account linkage became mandatory.
-    traded_account_ids = set()
-    traded_logins = set()
+    # trader_trades stores opened_at / closed_at and exact account/login identity.
+    # We read both exact trader_account_id and MT5 login for legacy linkage safety.
     trade_history_available = True
+    trade_rows_by_account = {}
+    trade_rows_by_login = {}
+
+    def _remember_trade_row(tr):
+        aid = str((tr or {}).get("trader_account_id") or "").strip()
+        lg = clean_login((tr or {}).get("mt5_login"))
+        if aid:
+            trade_rows_by_account.setdefault(aid, []).append(tr)
+        if lg:
+            trade_rows_by_login.setdefault(lg, []).append(tr)
 
     try:
         if registry_account_ids:
             rows = (
                 supabase.table("trader_trades")
-                .select("trader_account_id,mt5_login")
+                .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
                 .in_("trader_account_id", registry_account_ids)
                 .limit(10000)
                 .execute().data or []
             )
             for tr in rows:
-                aid = str(tr.get("trader_account_id") or "").strip()
-                lg = clean_login(tr.get("mt5_login"))
-                if aid:
-                    traded_account_ids.add(aid)
-                if lg:
-                    traded_logins.add(lg)
+                _remember_trade_row(tr)
     except Exception as exc:
         trade_history_available = False
-        print("V36 TRADE HISTORY ACCOUNT LOOKUP ERROR:", repr(exc), flush=True)
+        print("V38 TRADE HISTORY ACCOUNT LOOKUP ERROR:", repr(exc), flush=True)
 
     try:
         registry_logins = sorted({
@@ -2362,21 +2367,16 @@ def _monitoring_registry_rows():
         if registry_logins:
             rows = (
                 supabase.table("trader_trades")
-                .select("trader_account_id,mt5_login")
+                .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
                 .in_("mt5_login", registry_logins)
                 .limit(10000)
                 .execute().data or []
             )
             for tr in rows:
-                aid = str(tr.get("trader_account_id") or "").strip()
-                lg = clean_login(tr.get("mt5_login"))
-                if aid:
-                    traded_account_ids.add(aid)
-                if lg:
-                    traded_logins.add(lg)
+                _remember_trade_row(tr)
     except Exception as exc:
         trade_history_available = False
-        print("V36 TRADE HISTORY LOGIN LOOKUP ERROR:", repr(exc), flush=True)
+        print("V38 TRADE HISTORY LOGIN LOOKUP ERROR:", repr(exc), flush=True)
 
     live = []
     rejected = []
@@ -2493,88 +2493,166 @@ def _monitoring_registry_rows():
                 return dt, source
         return None, "assignment_time_missing"
 
-    def _account_has_activity(account):
+    def _trade_rows_for_account(account):
         rid = str((account or {}).get("id") or "").strip()
         login = clean_login((account or {}).get("mt5_login"))
-        if rid in traded_account_ids or (login and login in traded_logins):
-            return True, "trader_trades"
+        rows = []
+        seen = set()
 
-        # Legacy safety: a materially moved balance/equity is evidence the account
-        # has traded even if old trade-history rows were not linked correctly.
-        start = num(
-            (account or {}).get("start_balance")
-            or (account or {}).get("account_size")
-            or 0
-        )
-        values = [
-            num((account or {}).get("current_balance")),
-            num((account or {}).get("current_equity")),
-            num((account or {}).get("highest_equity")),
-            num((account or {}).get("lowest_equity")),
-        ]
-        if start > 0:
-            for value in values:
-                if value > 0 and abs(value - start) > max(1.0, start * 0.000001):
-                    return True, "financial_movement"
+        for tr in (trade_rows_by_account.get(rid) or []):
+            key = (
+                str(tr.get("opened_at") or ""),
+                str(tr.get("closed_at") or ""),
+                str(tr.get("status") or ""),
+                str(tr.get("mt5_login") or ""),
+            )
+            if key not in seen:
+                seen.add(key)
+                rows.append(tr)
 
-        if abs(num((account or {}).get("profit"))) > 0.000001:
-            return True, "profit_movement"
-        if abs(num((account or {}).get("profit_percent"))) > 0.000001:
-            return True, "profit_percent_movement"
+        for tr in (trade_rows_by_login.get(login) or []):
+            key = (
+                str(tr.get("opened_at") or ""),
+                str(tr.get("closed_at") or ""),
+                str(tr.get("status") or ""),
+                str(tr.get("mt5_login") or ""),
+            )
+            if key not in seen:
+                seen.add(key)
+                rows.append(tr)
 
-        return False, "no_trade_activity"
+        return rows
+
+    def _rolling_trade_activity(account):
+        rows = _trade_rows_for_account(account)
+        if not rows:
+            return {
+                "has_ever_traded": False,
+                "has_open_trade": False,
+                "last_activity_at": None,
+                "last_activity_source": None,
+                "trade_rows_seen": 0,
+            }
+
+        has_open = False
+        last_dt = None
+        last_source = None
+
+        for tr in rows:
+            status = str((tr or {}).get("status") or "").strip().lower()
+            closed_raw = str((tr or {}).get("closed_at") or "").strip()
+
+            # Exact OPEN exposure always remains under DD policing.
+            if status in {"open", "opened", "active", "position_open"} and not closed_raw:
+                has_open = True
+
+            for source in ("closed_at", "opened_at"):
+                dt = _parse_dt((tr or {}).get(source))
+                if dt is not None and (last_dt is None or dt > last_dt):
+                    last_dt = dt
+                    last_source = source
+
+        return {
+            "has_ever_traded": True,
+            "has_open_trade": has_open,
+            "last_activity_at": last_dt,
+            "last_activity_source": last_source,
+            "trade_rows_seen": len(rows),
+        }
 
     def _seven_day_inactivity_status(reg, account, purchase, pool):
-        # If trade-history infrastructure itself is unavailable, do NOT falsely
-        # expire legitimate accounts. Other current-proof/terminal gates continue.
+        # Never make an irreversible inactivity decision when trade-history
+        # infrastructure is unavailable.
         if not trade_history_available:
             return False, {
                 "rule_applied": False,
                 "reason": "trade_history_unavailable",
             }
 
-        has_activity, activity_source = _account_has_activity(account)
+        activity = _rolling_trade_activity(account)
         assigned_at, assignment_source = _assignment_time(reg, account, purchase, pool)
 
-        if has_activity:
+        # Open exposure always stays in the 3-second DD fleet.
+        if activity["has_open_trade"]:
             return False, {
                 "rule_applied": True,
-                "activity_found": True,
-                "activity_source": activity_source,
-                "assignment_source": assignment_source,
-                "assigned_at": assigned_at.isoformat() if assigned_at else None,
+                "has_ever_traded": True,
+                "has_open_trade": True,
+                "last_activity_at": (
+                    activity["last_activity_at"].isoformat()
+                    if activity["last_activity_at"] else None
+                ),
+                "last_activity_source": activity["last_activity_source"],
+                "trade_rows_seen": activity["trade_rows_seen"],
+                "reason": "open_trade_keep_monitoring",
             }
 
+        # Trader has traded before: rolling 7-day clock starts from the most
+        # recent OPEN/CLOSE trade timestamp.
+        if activity["has_ever_traded"]:
+            last_dt = activity["last_activity_at"]
+            if last_dt is None:
+                # Trade row exists but no reliable timestamp: fail safe, keep it.
+                return False, {
+                    "rule_applied": False,
+                    "has_ever_traded": True,
+                    "has_open_trade": False,
+                    "trade_rows_seen": activity["trade_rows_seen"],
+                    "reason": "trade_timestamp_missing",
+                }
+
+            idle_days = (datetime.now(timezone.utc) - last_dt).total_seconds() / 86400.0
+            if idle_days >= 7.0:
+                return True, {
+                    "rule_applied": True,
+                    "has_ever_traded": True,
+                    "has_open_trade": False,
+                    "last_activity_at": last_dt.isoformat(),
+                    "last_activity_source": activity["last_activity_source"],
+                    "inactive_days": round(idle_days, 3),
+                    "trade_rows_seen": activity["trade_rows_seen"],
+                    "reason": "stale_inactive_expired_7days_since_last_trade",
+                }
+
+            return False, {
+                "rule_applied": True,
+                "has_ever_traded": True,
+                "has_open_trade": False,
+                "last_activity_at": last_dt.isoformat(),
+                "last_activity_source": activity["last_activity_source"],
+                "inactive_days": round(idle_days, 3),
+                "trade_rows_seen": activity["trade_rows_seen"],
+                "reason": "recent_trade_within_7days",
+            }
+
+        # Never traded: clock starts at assignment.
         if assigned_at is None:
-            # Missing assignment time is not enough to invent a 7-day expiry.
             return False, {
                 "rule_applied": False,
-                "activity_found": False,
+                "has_ever_traded": False,
                 "reason": "assignment_time_missing",
             }
 
-        age_seconds = (datetime.now(timezone.utc) - assigned_at).total_seconds()
-        age_days = age_seconds / 86400.0
-
-        if age_days >= 7.0:
+        idle_days = (datetime.now(timezone.utc) - assigned_at).total_seconds() / 86400.0
+        if idle_days >= 7.0:
             return True, {
                 "rule_applied": True,
-                "activity_found": False,
-                "activity_source": activity_source,
+                "has_ever_traded": False,
+                "has_open_trade": False,
                 "assignment_source": assignment_source,
                 "assigned_at": assigned_at.isoformat(),
-                "age_days": round(age_days, 3),
-                "reason": "stale_inactive_expired_7days",
+                "inactive_days": round(idle_days, 3),
+                "reason": "stale_inactive_expired_7days_since_assignment",
             }
 
         return False, {
             "rule_applied": True,
-            "activity_found": False,
-            "activity_source": activity_source,
+            "has_ever_traded": False,
+            "has_open_trade": False,
             "assignment_source": assignment_source,
             "assigned_at": assigned_at.isoformat(),
-            "age_days": round(age_days, 3),
-            "reason": "within_7day_grace",
+            "inactive_days": round(idle_days, 3),
+            "reason": "new_account_within_7day_grace",
         }
 
     for reg in registry:
@@ -2638,14 +2716,45 @@ def _monitoring_registry_rows():
             reg, account, purchase, pool
         )
         if expired_7d:
-            stale_inactive.append({
+            stale_row = {
                 "trader_account_id": rid,
                 "trader_id": trader_id,
                 "mt5_login": account.get("mt5_login") or reg.get("mt5_login"),
                 "stage": account.get("stage") or account.get("phase"),
                 "account_status": account.get("account_status"),
                 **inactivity_info,
-            })
+            }
+            stale_inactive.append(stale_row)
+
+            # V38 SOLID ROLLING LAW:
+            # 7 consecutive days without trading activity = this MT5 lifecycle is invalid.
+            # Persist the decision in monitoring_registry so it does not merely
+            # disappear for one API response and then return on a later cycle.
+            try:
+                (
+                    supabase.table("monitoring_registry")
+                    .update({
+                        "active": False,
+                        "monitoring_state": "RETIRED",
+                        "retirement_reason": inactivity_info.get("reason") or "stale_inactive_expired_7days",
+                        "current_proof_source": "expired_rolling_7day_no_activity",
+                        "current_proof_checked_at": now_iso(),
+                        "orphaned_at": now_iso(),
+                        "retired_at": now_iso(),
+                        "updated_at": now_iso(),
+                    })
+                    .eq("trader_account_id", rid)
+                    .eq("active", True)
+                    .execute()
+                )
+                stale_row["persisted_retirement"] = True
+            except Exception as exc:
+                # Fail safely: even if persistence has a transient DB problem,
+                # this account remains excluded from the current DD feed.
+                stale_row["persisted_retirement"] = False
+                stale_row["persist_error"] = str(exc)
+                print("V37 7DAY PERSIST RETIRE ERROR:", rid, repr(exc), flush=True)
+
             continue
 
         # Purchase pointer is the journey-slot authority. If NEW exists, OLD is out.
@@ -2827,6 +2936,8 @@ def monitoring_exchange_health():
             "live_current_instances": len(live),
             "positive_proof_gate": True,
             "seven_day_inactivity_gate": True,
+            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_auto_retire",
+            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_auto_retire",
             "seven_day_trade_history_available": _LAST_7DAY_TRADE_HISTORY_AVAILABLE,
             "stale_inactive_expired_count": len(_LAST_7DAY_INACTIVE_EXPIRED),
             "stale_inactive_expired": _LAST_7DAY_INACTIVE_EXPIRED[:100],
@@ -3081,7 +3192,7 @@ def dd_registry_coverage_health():
         ready = (len(rejected) == 0 and len(invalid) == 0 and len(out) > 0)
         return ok({
             "release": NAIRAPIPS_MONITORING_RELEASE,
-            "dd_feed_source": "monitoring_registry_positive_current_proof_7day_gate",
+            "dd_feed_source": "monitoring_registry_positive_current_proof_rolling_7day_gate",
             "registry_dd_population": len(out),
             "positive_proof_gate": True,
             "seven_day_inactivity_gate": True,
