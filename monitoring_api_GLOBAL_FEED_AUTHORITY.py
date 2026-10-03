@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V38_ROLLING_7DAY_INACTIVITY_AUTO_RETIRE_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V39_ATOMIC_7DAY_RETIREMENT_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2191,6 +2191,95 @@ def _retire_registry_row(reg, reason):
         return False
 
 
+
+def _retire_inactive_registry_v39(reg, reason):
+    """Atomically retire one exact registry lifecycle via SECURITY DEFINER RPC.
+
+    V38 used a direct table update. In production/RLS that can appear successful
+    without giving us a durable, verified retirement. V39 uses the same
+    np_monitoring_retire RPC already used by the main lifecycle backend, then
+    verifies the exact registry row through np_monitoring_registry_read.
+
+    Return: (verified_retired: bool, verification_payload: dict)
+    """
+    aid = str((reg or {}).get("trader_account_id") or "").strip()
+    login = clean_login((reg or {}).get("mt5_login"))
+    if not aid:
+        return False, {"reason": "missing_trader_account_id"}
+
+    try:
+        supabase.rpc("np_monitoring_retire", {
+            "p_trader_account_id": aid,
+            "p_reason": str(reason or "stale_inactive_expired_7days")[:500],
+            "p_successor_account_id": None,
+        }).execute()
+    except Exception as exc:
+        return False, {
+            "reason": "retire_rpc_failed",
+            "error": repr(exc),
+            "trader_account_id": aid,
+            "mt5_login": login,
+        }
+
+    # Verify against the authoritative registry reader, not the table update response.
+    try:
+        rows = supabase.rpc("np_monitoring_registry_read", {}).execute().data or []
+        exact = next(
+            (
+                r for r in rows
+                if str(r.get("trader_account_id") or "").strip() == aid
+            ),
+            None,
+        )
+        if exact is None:
+            # Missing from the registry reader after retirement is also safe:
+            # it cannot be delivered to the shards.
+            return True, {
+                "verified": True,
+                "verification": "not_present_in_registry_reader",
+                "trader_account_id": aid,
+                "mt5_login": login,
+            }
+
+        active = bool_true(exact.get("active"))
+        state = str(exact.get("monitoring_state") or "").strip().upper()
+        verified = (not active) or state == "RETIRED"
+
+        # Metadata is useful, but retirement authority is the RPC above.
+        if verified:
+            try:
+                (
+                    supabase.table("monitoring_registry")
+                    .update({
+                        "current_proof_source": "expired_rolling_7day_no_activity",
+                        "current_proof_checked_at": now_iso(),
+                        "orphaned_at": exact.get("orphaned_at") or now_iso(),
+                        "updated_at": now_iso(),
+                    })
+                    .eq("trader_account_id", aid)
+                    .execute()
+                )
+            except Exception:
+                pass
+
+        return verified, {
+            "verified": verified,
+            "verification": "registry_reader",
+            "active": active,
+            "monitoring_state": state,
+            "retirement_reason": exact.get("retirement_reason"),
+            "trader_account_id": aid,
+            "mt5_login": login,
+        }
+    except Exception as exc:
+        return False, {
+            "reason": "retirement_verification_failed",
+            "error": repr(exc),
+            "trader_account_id": aid,
+            "mt5_login": login,
+        }
+
+
 _LAST_CURRENT_PROOF_QUARANTINE = []
 _LAST_7DAY_INACTIVE_EXPIRED = []
 _LAST_7DAY_TRADE_HISTORY_AVAILABLE = True
@@ -2726,35 +2815,31 @@ def _monitoring_registry_rows():
             }
             stale_inactive.append(stale_row)
 
-            # V38 SOLID ROLLING LAW:
-            # 7 consecutive days without trading activity = this MT5 lifecycle is invalid.
-            # Persist the decision in monitoring_registry so it does not merely
-            # disappear for one API response and then return on a later cycle.
-            try:
-                (
-                    supabase.table("monitoring_registry")
-                    .update({
-                        "active": False,
-                        "monitoring_state": "RETIRED",
-                        "retirement_reason": inactivity_info.get("reason") or "stale_inactive_expired_7days",
-                        "current_proof_source": "expired_rolling_7day_no_activity",
-                        "current_proof_checked_at": now_iso(),
-                        "orphaned_at": now_iso(),
-                        "retired_at": now_iso(),
-                        "updated_at": now_iso(),
-                    })
-                    .eq("trader_account_id", rid)
-                    .eq("active", True)
-                    .execute()
-                )
-                stale_row["persisted_retirement"] = True
-            except Exception as exc:
-                # Fail safely: even if persistence has a transient DB problem,
-                # this account remains excluded from the current DD feed.
-                stale_row["persisted_retirement"] = False
-                stale_row["persist_error"] = str(exc)
-                print("V37 7DAY PERSIST RETIRE ERROR:", rid, repr(exc), flush=True)
+            # V39 ATOMIC LAW:
+            # Use the same SECURITY DEFINER retirement RPC as the main lifecycle
+            # backend and verify the exact registry row before calling the write
+            # durable. This prevents one endpoint seeing 81 while another sees 82
+            # because a direct RLS-protected table update did not actually stick.
+            verified_retired, retire_verification = _retire_inactive_registry_v39(
+                reg,
+                inactivity_info.get("reason") or "stale_inactive_expired_7days",
+            )
+            stale_row["persisted_retirement"] = bool(verified_retired)
+            stale_row["retirement_verification"] = retire_verification
 
+            if not verified_retired:
+                print(
+                    "V39 7DAY RETIREMENT NOT VERIFIED:",
+                    {
+                        "trader_account_id": rid,
+                        "mt5_login": stale_row.get("mt5_login"),
+                        "verification": retire_verification,
+                    },
+                    flush=True,
+                )
+
+            # Safety invariant: even when persistence verification fails, the stale
+            # account is excluded from THIS feed cycle. It cannot consume a DD slot.
             continue
 
         # Purchase pointer is the journey-slot authority. If NEW exists, OLD is out.
@@ -2936,8 +3021,10 @@ def monitoring_exchange_health():
             "live_current_instances": len(live),
             "positive_proof_gate": True,
             "seven_day_inactivity_gate": True,
-            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_auto_retire",
-            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_auto_retire",
+            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_atomic_auto_retire",
+            "seven_day_retirement_authority": "np_monitoring_retire_rpc_verified",
+            "seven_day_rule_mode": "rolling_7_days_no_trading_activity_atomic_auto_retire",
+            "seven_day_retirement_authority": "np_monitoring_retire_rpc_verified",
             "seven_day_trade_history_available": _LAST_7DAY_TRADE_HISTORY_AVAILABLE,
             "stale_inactive_expired_count": len(_LAST_7DAY_INACTIVE_EXPIRED),
             "stale_inactive_expired": _LAST_7DAY_INACTIVE_EXPIRED[:100],
@@ -3192,7 +3279,7 @@ def dd_registry_coverage_health():
         ready = (len(rejected) == 0 and len(invalid) == 0 and len(out) > 0)
         return ok({
             "release": NAIRAPIPS_MONITORING_RELEASE,
-            "dd_feed_source": "monitoring_registry_positive_current_proof_rolling_7day_gate",
+            "dd_feed_source": "monitoring_registry_positive_current_proof_atomic_rolling_7day_gate",
             "registry_dd_population": len(out),
             "positive_proof_gate": True,
             "seven_day_inactivity_gate": True,
