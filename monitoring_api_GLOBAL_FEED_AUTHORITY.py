@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V42_FINAL_ASSIGNMENT_WATCHDOG_INACTIVITY_FIX_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V43_VALID_ROSTER_QUARANTINE_NO_GLOBAL_BLOCK_2026_10_03"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -3261,21 +3261,18 @@ def monitorable_accounts():
     try:
         out, rejected = _monitoring_registry_rows()
 
-        # A rejected registry row means lifecycle and registry disagree. Do not
-        # silently feed a partial roster to DD Police; surface the inconsistency.
+        # V43 FAULT-ISOLATION LAW:
+        # A bad/stale registry row must quarantine ONLY that exact lifecycle row.
+        # It must never block the 4 DD shards from receiving every other verified
+        # LIVE/WATCHDOG account. V42 returned HTTP 503 whenever even one rejected
+        # row existed, which froze the roster watcher on its last-good snapshot
+        # and made newly assigned valid accounts invisible to all shards.
         if rejected:
             print(
-                "DD REGISTRY FEED BLOCKED: rejected registry rows",
+                "DD REGISTRY FEED QUARANTINE:",
                 {"accepted": len(out), "rejected": len(rejected), "sample": rejected[:20]},
                 flush=True,
             )
-            return bad({
-                "error": "DD registry roster contains rejected source rows",
-                "accepted_count": len(out),
-                "rejected_count": len(rejected),
-                "rejected": rejected[:100],
-                "release": NAIRAPIPS_MONITORING_RELEASE,
-            }, 503)
 
         if not out:
             print("DD REGISTRY FEED BLOCKED: zero current registry accounts", flush=True)
@@ -3290,7 +3287,7 @@ def monitorable_accounts():
 
         print(
             "DD REGISTRY FEED COMPLETE:",
-            {"monitorable": len(out), "rejected": 0},
+            {"monitorable": len(out), "quarantined_rejected": len(rejected)},
             flush=True,
         )
         # Preserve the exact legacy response envelope expected by V3.6:
