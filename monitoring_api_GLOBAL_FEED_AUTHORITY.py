@@ -1,3 +1,4 @@
+# V48 2026-10-07: global trader_accounts write normalizer — legacy breach_at input is mapped to production breached_at before every verified account update. DD/target/roster logic unchanged.
 # V47 2026-10-07: schema-only fix — write trader_accounts.breached_at, never nonexistent breach_at. DD/target/roster logic unchanged.
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
 NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
@@ -776,6 +777,16 @@ def verified_account_update(account_id, payload):
     account_id = str(account_id or '').strip()
     if not account_id:
         return False, {}, 'missing_account_id'
+
+    # V48 GLOBAL SCHEMA NORMALIZER:
+    # Production trader_accounts uses `breached_at`. Older monitoring paths may
+    # still hand this helper a legacy `breach_at` key. Normalize centrally so
+    # NO verified trader_accounts write can ever send the nonexistent column.
+    payload = dict(payload or {})
+    if 'breach_at' in payload:
+        legacy_breach_at = payload.pop('breach_at', None)
+        if legacy_breach_at not in (None, '') and payload.get('breached_at') in (None, ''):
+            payload['breached_at'] = legacy_breach_at
 
     ok, removed, err = _np_adaptive_table_update('trader_accounts', 'id', account_id, payload)
     if not ok:
