@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V43_VALID_ROSTER_QUARANTINE_NO_GLOBAL_BLOCK_2026_10_03"
+NAIRAPIPS_MONITORING_RELEASE = "V43_SAFE_ROLLING_7DAY_ACTIVITY_PROOF_2026_10_07"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -2661,6 +2661,83 @@ def _monitoring_registry_rows():
         activity = _rolling_trade_activity(account)
         assigned_at, assignment_source = _assignment_time(reg, account, purchase, pool)
 
+        # V43 SAFETY REPAIR — never classify an aged account as "never traded"
+        # merely because the broad bulk trader_trades read did not return its rows.
+        # The broad read is intentionally capped and, with duplicate/history-heavy
+        # accounts, a valid account can be absent from that result set.
+        #
+        # We only pay for an exact fallback read when ALL of these are true:
+        #   1) bulk history says no trade rows, and
+        #   2) the account is old enough that assignment-based retirement is possible.
+        # Young accounts therefore add no extra DB traffic. A genuinely never-traded
+        # aged account is probed once on the cycle that can retire it, then disappears
+        # from the live registry after verified retirement.
+        if (
+            not activity["has_ever_traded"]
+            and assigned_at is not None
+            and (datetime.now(timezone.utc) - assigned_at).total_seconds() >= (7.0 * 86400.0)
+        ):
+            exact_rows = []
+            rid = str((account or {}).get("id") or "").strip()
+            login = clean_login((account or {}).get("mt5_login"))
+
+            try:
+                if rid:
+                    exact_rows = (
+                        supabase.table("trader_trades")
+                        .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
+                        .eq("trader_account_id", rid)
+                        .order("opened_at", desc=True)
+                        .limit(1000)
+                        .execute().data or []
+                    )
+            except Exception as exc:
+                # Fail closed: an inability to prove "never traded" must never
+                # retire a live account.
+                return False, {
+                    "rule_applied": False,
+                    "has_ever_traded": False,
+                    "reason": "exact_trade_history_probe_failed",
+                    "error": repr(exc),
+                }
+
+            # Legacy safety: only use login fallback if exact account linkage returned
+            # nothing. This preserves current-account identity as the first authority.
+            if not exact_rows and login:
+                try:
+                    exact_rows = (
+                        supabase.table("trader_trades")
+                        .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
+                        .eq("mt5_login", login)
+                        .order("opened_at", desc=True)
+                        .limit(1000)
+                        .execute().data or []
+                    )
+                except Exception as exc:
+                    return False, {
+                        "rule_applied": False,
+                        "has_ever_traded": False,
+                        "reason": "exact_trade_history_login_probe_failed",
+                        "error": repr(exc),
+                    }
+
+            if exact_rows:
+                # Feed the exact proof into the same established rolling activity
+                # evaluator. No DD, lifecycle, target, or shard logic is changed.
+                for tr in exact_rows:
+                    _remember_trade_row(tr)
+                activity = _rolling_trade_activity(account)
+
+                # Defensive invariant: if exact rows exist but cannot be interpreted,
+                # do NOT fall through to the never-traded retirement branch.
+                if not activity["has_ever_traded"]:
+                    return False, {
+                        "rule_applied": False,
+                        "has_ever_traded": True,
+                        "reason": "exact_trade_rows_uninterpretable_keep_monitoring",
+                        "exact_trade_rows_seen": len(exact_rows),
+                    }
+
         # Open exposure always stays in the 3-second DD fleet.
         if activity["has_open_trade"]:
             return False, {
@@ -3261,18 +3338,21 @@ def monitorable_accounts():
     try:
         out, rejected = _monitoring_registry_rows()
 
-        # V43 FAULT-ISOLATION LAW:
-        # A bad/stale registry row must quarantine ONLY that exact lifecycle row.
-        # It must never block the 4 DD shards from receiving every other verified
-        # LIVE/WATCHDOG account. V42 returned HTTP 503 whenever even one rejected
-        # row existed, which froze the roster watcher on its last-good snapshot
-        # and made newly assigned valid accounts invisible to all shards.
+        # A rejected registry row means lifecycle and registry disagree. Do not
+        # silently feed a partial roster to DD Police; surface the inconsistency.
         if rejected:
             print(
-                "DD REGISTRY FEED QUARANTINE:",
+                "DD REGISTRY FEED BLOCKED: rejected registry rows",
                 {"accepted": len(out), "rejected": len(rejected), "sample": rejected[:20]},
                 flush=True,
             )
+            return bad({
+                "error": "DD registry roster contains rejected source rows",
+                "accepted_count": len(out),
+                "rejected_count": len(rejected),
+                "rejected": rejected[:100],
+                "release": NAIRAPIPS_MONITORING_RELEASE,
+            }, 503)
 
         if not out:
             print("DD REGISTRY FEED BLOCKED: zero current registry accounts", flush=True)
@@ -3287,7 +3367,7 @@ def monitorable_accounts():
 
         print(
             "DD REGISTRY FEED COMPLETE:",
-            {"monitorable": len(out), "quarantined_rejected": len(rejected)},
+            {"monitorable": len(out), "rejected": 0},
             flush=True,
         )
         # Preserve the exact legacy response envelope expected by V3.6:
