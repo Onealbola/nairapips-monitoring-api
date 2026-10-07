@@ -1,5 +1,5 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V43_SAFE_ROLLING_7DAY_ACTIVITY_PROOF_2026_10_07"
+NAIRAPIPS_MONITORING_RELEASE = "V44_ROSTER_SELF_HEALING_2026_10_07"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -3338,21 +3338,27 @@ def monitorable_accounts():
     try:
         out, rejected = _monitoring_registry_rows()
 
-        # A rejected registry row means lifecycle and registry disagree. Do not
-        # silently feed a partial roster to DD Police; surface the inconsistency.
+        # V44 ROSTER SELF-HEALING:
+        # Rejected registry rows have ALREADY been excluded by
+        # _monitoring_registry_rows(). They must never poison the accepted roster.
+        #
+        # Previous behaviour returned HTTP 503 when even ONE unrelated registry
+        # row was rejected. The unchanged V3.6 DD shards correctly retained their
+        # last-good roster on that 503, but that also meant a newly assigned or
+        # repaired LIVE account could never enter the fleet until every unrelated
+        # inconsistency was cleared. This is a roster-refresh deadlock.
+        #
+        # Safety law:
+        #   - rejected rows remain OUT of the DD feed;
+        #   - accepted, positively-proven rows continue to refresh normally;
+        #   - zero accepted rows still fails closed below;
+        #   - DD calculation/shard/breach logic is untouched.
         if rejected:
             print(
-                "DD REGISTRY FEED BLOCKED: rejected registry rows",
+                "DD REGISTRY FEED DEGRADED: rejected rows excluded; accepted roster continues",
                 {"accepted": len(out), "rejected": len(rejected), "sample": rejected[:20]},
                 flush=True,
             )
-            return bad({
-                "error": "DD registry roster contains rejected source rows",
-                "accepted_count": len(out),
-                "rejected_count": len(rejected),
-                "rejected": rejected[:100],
-                "release": NAIRAPIPS_MONITORING_RELEASE,
-            }, 503)
 
         if not out:
             print("DD REGISTRY FEED BLOCKED: zero current registry accounts", flush=True)
