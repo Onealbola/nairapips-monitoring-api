@@ -1,10 +1,10 @@
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
-NAIRAPIPS_MONITORING_RELEASE = "V44_ROSTER_SELF_HEALING_2026_10_07"
+NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os, re, json
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
@@ -2411,15 +2411,16 @@ def _monitoring_registry_rows():
         and "bootstrap" not in str(ev.get("reason") or "").lower()
     }
 
-    # V38 ROLLING 7-DAY INACTIVITY RULE
-    # Business law:
-    #   - If the account has NEVER traded, count 7 days from assignment.
-    #   - If it HAS traded, count 7 consecutive days from the LAST trading activity.
-    #   - If any trade is currently OPEN, the account remains under DD monitoring
-    #     regardless of how old the position is.
+    # V45 FAST ROSTER ACTIVITY PROOF
+    # The old V38 path downloaded up to 10,000 trader_trades rows TWICE on every
+    # /monitorable_accounts refresh. Production contains duplicate-heavy trade
+    # history, so that hot-path read could exceed the roster watcher's HTTP timeout.
     #
-    # trader_trades stores opened_at / closed_at and exact account/login identity.
-    # We read both exact trader_account_id and MT5 login for legacy linkage safety.
+    # The 7-day business law does not require all historical trades. For the live
+    # roster we only need evidence that activity happened inside the rolling 7-day
+    # window. Accounts with no recent evidence are handled by the exact fallback
+    # probe below before any irreversible retirement decision. This keeps the same
+    # inactivity law while removing the unbounded history transfer from the DD feed.
     trade_history_available = True
     trade_rows_by_account = {}
     trade_rows_by_login = {}
@@ -2432,40 +2433,70 @@ def _monitoring_registry_rows():
         if lg:
             trade_rows_by_login.setdefault(lg, []).append(tr)
 
+    registry_logins = sorted({
+        clean_login(r.get("mt5_login"))
+        for r in registry
+        if clean_login(r.get("mt5_login"))
+    })
+    activity_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    trade_select = "trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at"
+
+    # Recent OPEN timestamps. This is bounded to the only window that can reset the
+    # inactivity clock; it replaces the former 10k all-history account read.
     try:
         if registry_account_ids:
             rows = (
                 supabase.table("trader_trades")
-                .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
+                .select(trade_select)
                 .in_("trader_account_id", registry_account_ids)
-                .limit(10000)
+                .gte("opened_at", activity_cutoff)
+                .order("opened_at", desc=True)
+                .limit(5000)
                 .execute().data or []
             )
             for tr in rows:
                 _remember_trade_row(tr)
     except Exception as exc:
         trade_history_available = False
-        print("V38 TRADE HISTORY ACCOUNT LOOKUP ERROR:", repr(exc), flush=True)
+        print("V45 RECENT TRADE ACCOUNT LOOKUP ERROR:", repr(exc), flush=True)
 
+    # Recent CLOSE timestamps catch positions opened earlier but closed inside the
+    # last seven days. Dedupe happens in _trade_rows_for_account().
     try:
-        registry_logins = sorted({
-            clean_login(r.get("mt5_login"))
-            for r in registry
-            if clean_login(r.get("mt5_login"))
-        })
+        if registry_account_ids:
+            rows = (
+                supabase.table("trader_trades")
+                .select(trade_select)
+                .in_("trader_account_id", registry_account_ids)
+                .gte("closed_at", activity_cutoff)
+                .order("closed_at", desc=True)
+                .limit(5000)
+                .execute().data or []
+            )
+            for tr in rows:
+                _remember_trade_row(tr)
+    except Exception as exc:
+        trade_history_available = False
+        print("V45 RECENT TRADE CLOSE LOOKUP ERROR:", repr(exc), flush=True)
+
+    # Legacy rows may have login but no trader_account_id. Keep that compatibility,
+    # but only inside the same seven-day window instead of downloading all history.
+    try:
         if registry_logins:
             rows = (
                 supabase.table("trader_trades")
-                .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
+                .select(trade_select)
                 .in_("mt5_login", registry_logins)
-                .limit(10000)
+                .gte("opened_at", activity_cutoff)
+                .order("opened_at", desc=True)
+                .limit(5000)
                 .execute().data or []
             )
             for tr in rows:
                 _remember_trade_row(tr)
     except Exception as exc:
         trade_history_available = False
-        print("V38 TRADE HISTORY LOGIN LOOKUP ERROR:", repr(exc), flush=True)
+        print("V45 RECENT TRADE LOGIN LOOKUP ERROR:", repr(exc), flush=True)
 
     live = []
     rejected = []
@@ -2688,7 +2719,7 @@ def _monitoring_registry_rows():
                         .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
                         .eq("trader_account_id", rid)
                         .order("opened_at", desc=True)
-                        .limit(1000)
+                        .limit(25)
                         .execute().data or []
                     )
             except Exception as exc:
@@ -2710,7 +2741,7 @@ def _monitoring_registry_rows():
                         .select("trader_account_id,mt5_login,status,opened_at,closed_at,synced_at,updated_at")
                         .eq("mt5_login", login)
                         .order("opened_at", desc=True)
-                        .limit(1000)
+                        .limit(25)
                         .execute().data or []
                     )
                 except Exception as exc:
