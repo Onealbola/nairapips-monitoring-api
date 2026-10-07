@@ -1,3 +1,4 @@
+# V47 2026-10-07: schema-only fix — write trader_accounts.breached_at, never nonexistent breach_at. DD/target/roster logic unchanged.
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
 NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
 import time
@@ -1000,7 +1001,6 @@ def apply_intelligence(account, snapshot):
         update["archive_reason"] = snapshot.get("reason") or ("Static drawdown breached" if breached else "Target reached")
         if breached:
             _breach_ts = account.get("breach_at") or account.get("breached_at") or now_iso()
-            update["breach_at"] = _breach_ts
             update["breached_at"] = _breach_ts
             update["breach_reason"] = snapshot.get("reason") or (
                 f"Static {dd_limit_percent:g}% drawdown breached. "
@@ -1029,7 +1029,7 @@ def apply_intelligence(account, snapshot):
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
             account.get("id"), {
                 "breach_reason": preflight_reason,
-                "breach_at": update.get("breach_at") or now_iso(),
+                "breached_at": update.get("breached_at") or now_iso(),
                 "breach_equity_level": update.get("breach_equity_level") or min(lowest, equity, current_balance),
             }
         )
@@ -3504,7 +3504,7 @@ def disable_mt5_access():
         preflight_ok, preflight_row, preflight_mode = verified_account_update(
             account.get("id"), {
                 "breach_reason": reason,
-                "breach_at": _guard_breach_at,
+                "breached_at": _guard_breach_at,
                 "breach_equity_level": _guard_breach_level,
             }
         )
@@ -3543,10 +3543,8 @@ def disable_mt5_access():
         "drawdown_percent": data.get("drawdown_percent") if data.get("drawdown_percent") not in (None, "") else data.get("drawdown"),
         "dd_used_percent": data.get("dd_used_percent"),
         "phase_pass_status": "" if "breach" in status else data.get("phase_pass_status"),
-        # Production DB guard requires breach_reason + breach_at + breach_equity_level
-        # in the same terminal transition. Keep breached_at too for compatibility
-        # with older readers, but breach_at is the constraint-authoritative field.
-        "breach_at": (account.get("breach_at") or account.get("breached_at") or now_iso()) if "breach" in status else account.get("breach_at"),
+        # V47: production schema uses trader_accounts.breached_at.
+        # Keep legacy breach_at READ compatibility, but never write the nonexistent column.
         "breached_at": (account.get("breached_at") or account.get("breach_at") or now_iso()) if "breach" in status else account.get("breached_at"),
         "breach_equity_level": (
             data.get("breach_equity_level")
