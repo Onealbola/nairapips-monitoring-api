@@ -1127,6 +1127,7 @@ def apply_intelligence(account, snapshot):
         "target_equity": target_equity,
         "pass_progress_percent": pass_progress,
         "message": snapshot.get("reason") or "Monitoring snapshot applied",
+        "source": str(snapshot.get("source") or "monitoring_api_legacy").strip(),
         "intelligence_version": "NIC_SPRINT1",
         "intelligence_event_id": f"{account.get('id')}:{snapshot.get('timestamp') or now_iso()}",
         "starting_balance": start,
@@ -3439,6 +3440,25 @@ def monitoring_snapshot():
     account_id = data.get("trader_account_id") or data.get("current_account_id")
     if not account_id:
         return bad("Exact trader_account_id is required for snapshot", 400)
+
+    # V49 LIVE MT5 SNAPSHOT AUTHORITY GATE.
+    # Never manufacture a fresh financial snapshot from trader_accounts fallback values.
+    # Dashboard telemetry must carry BOTH a live MT5 balance and live MT5 equity.
+    _balance_aliases = ("current_balance", "balance", "account_balance", "Balance", "ACCOUNT_BALANCE", "mt5_balance", "live_balance")
+    _equity_aliases = ("current_equity", "equity", "account_equity", "Equity", "ACCOUNT_EQUITY", "mt5_equity", "live_equity")
+    _has_live_balance = any(data.get(k) not in (None, "") for k in _balance_aliases)
+    _has_live_equity = any(data.get(k) not in (None, "") for k in _equity_aliases)
+    if not (_has_live_balance and _has_live_equity):
+        print("V49 SNAPSHOT QUARANTINED missing live MT5 balance/equity", {"account_id": account_id, "mt5_login": data.get("mt5_login"), "source": data.get("source")}, flush=True)
+        return ok({"ignored": True, "reason": "missing_live_mt5_financial_evidence", "account_id": account_id, "mt5_login": data.get("mt5_login")}, "snapshot quarantined")
+
+    # A delayed queue item must not receive a new DB created_at and masquerade as live.
+    _snapshot_ts = _parse_iso_ts(data.get("timestamp"))
+    if _snapshot_ts is not None:
+        _snapshot_age = (datetime.now(timezone.utc) - _snapshot_ts).total_seconds()
+        if _snapshot_age > 180:
+            print("V49 SNAPSHOT QUARANTINED stale MT5 observation", {"account_id": account_id, "mt5_login": data.get("mt5_login"), "age_seconds": round(_snapshot_age, 1), "source": data.get("source")}, flush=True)
+            return ok({"ignored": True, "reason": "stale_mt5_observation", "age_seconds": round(_snapshot_age, 1), "account_id": account_id, "mt5_login": data.get("mt5_login")}, "stale snapshot quarantined")
     # V12 EXACT SNAPSHOT TERMINAL-STATE BRIDGE:
     # Snapshot requests are already bound to an immutable trader_account_id.
     # During a target/pass/profit-cap transition the same account may have been
