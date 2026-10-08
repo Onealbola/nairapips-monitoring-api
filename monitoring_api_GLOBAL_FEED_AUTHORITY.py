@@ -1138,13 +1138,15 @@ def apply_intelligence(account, snapshot):
         "drawdown_remaining_percent": max(0, dd_limit_percent - current_dd),
         "dd_limit_percent": dd_limit_percent,
         "breach_source": snapshot.get("breach_source") or ("equity" if equity <= breach_level else ""),
-        "created_at": now_iso(),
+        # V50: created_at is the MT5 OBSERVATION time, not delayed HTTP receipt time.
+        # This makes newest-row selection monotonic by financial observation.
+        "created_at": (snapshot.get("timestamp") if _parse_iso_ts(snapshot.get("timestamp")) is not None else now_iso()),
     }
     safe_insert("monitoring_events", event)
     try:
         snap = dict(event)
         snap["zone"] = zone
-        snap["created_at"] = now_iso()
+        # V50: retain event observation time. Never restamp delayed work as current.
         safe_insert("monitoring_snapshots", snap)
     except Exception:
         pass
@@ -3482,6 +3484,63 @@ def monitoring_snapshot():
             "persisted_account_status": account.get("account_status"),
         }, "terminal account snapshot acknowledged")
 
+    # V50 SINGLE LIVE TELEMETRY AUTHORITY.
+    # DD Police is already the broker-side DD authority. Its high-frequency dashboard
+    # feed must NOT run the heavyweight lifecycle/intelligence writer on every read.
+    # One MT5 observation -> one lightweight evidence insert. Breach/close remains in
+    # DD Police + /disable_mt5_access; target/progression remains with Operations.
+    _source = str(data.get("source") or "").strip().lower()
+    if _source.startswith("dd_police_live_mt5_"):
+        _obs = _parse_iso_ts(data.get("timestamp"))
+        _now = datetime.now(timezone.utc)
+        if _obs is None:
+            return ok({"ignored": True, "reason": "dd_live_missing_observation_timestamp", "account_id": account_id}, "DD live telemetry quarantined")
+        _age = (_now - _obs).total_seconds()
+        if _age > 180 or _age < -60:
+            return ok({"ignored": True, "reason": "dd_live_observation_outside_freshness_window", "age_seconds": round(_age, 1), "account_id": account_id}, "DD live telemetry quarantined")
+
+        _start = num(account.get("start_balance") or account.get("account_size") or data.get("start_balance") or data.get("account_size") or 0)
+        _bal = num(data.get("current_balance") if data.get("current_balance") not in (None, "") else data.get("balance"), 0)
+        _eq = num(data.get("current_equity") if data.get("current_equity") not in (None, "") else data.get("equity"), 0)
+        if _bal <= 0 or _eq <= 0 or _start <= 0:
+            return ok({"ignored": True, "reason": "dd_live_invalid_financial_values", "account_id": account_id}, "DD live telemetry quarantined")
+
+        _profit = round(_bal - _start, 2)
+        _profit_pct = round((_profit / _start) * 100.0, 4) if _start else 0.0
+        _row = {
+            "trader_id": account.get("trader_id"),
+            "trader_account_id": account.get("id"),
+            "mt5_login": clean_login(account.get("mt5_login") or data.get("mt5_login")),
+            "event_type": "snapshot",
+            "risk_zone": data.get("risk_zone") or data.get("zone") or account.get("risk_zone") or "safe",
+            "phase_label": account.get("stage") or data.get("phase_label") or "",
+            "balance": _bal, "current_balance": _bal,
+            "equity": _eq, "current_equity": _eq,
+            "profit": _profit, "profit_percent": _profit_pct,
+            "drawdown_percent": data.get("drawdown_percent"),
+            "dd_used_percent": data.get("dd_used_percent"),
+            "max_drawdown_used": data.get("max_drawdown_used"),
+            "dd_limit_percent": data.get("dd_limit_percent") or data.get("static_dd_limit_percent"),
+            "breach_equity_level": data.get("breach_equity_level"),
+            "starting_balance": _start,
+            "floating_profit": round(_eq - _bal, 2),
+            "message": "Live MT5 DD telemetry",
+            "source": str(data.get("source") or "dd_police_live_mt5"),
+            "intelligence_version": "LIVE_MT5_TELEMETRY_V50",
+            "intelligence_event_id": f"{account.get('id')}:{data.get('timestamp')}",
+            "created_at": _obs.isoformat(),
+        }
+        _saved = safe_insert("monitoring_snapshots", _row)
+        if not _saved:
+            return bad("Live DD telemetry snapshot persistence failed", 500)
+        return ok({
+            "account_id": account.get("id"),
+            "mt5_login": account.get("mt5_login"),
+            "telemetry_only": True,
+            "source": _row["source"],
+            "observed_at": _row["created_at"],
+        }, "live MT5 telemetry persisted")
+
     result = apply_intelligence(account, data)
     print(f"GLOBAL_FEED SNAPSHOT APPLIED mt5={data.get('mt5_login')} result={result}", flush=True)
     if not isinstance(result, dict) or not result.get("account_write_ok"):
@@ -4313,3 +4372,7 @@ def _np_recall_kick_exact_replacement_v9(auth_header, trader_id, journey_id, ent
         "journey_id": str(journey_id or "") or None,
         "trader_id": str(trader_id or "") or None,
     }
+
+
+NAIRAPIPS_V50_SINGLE_LIVE_TELEMETRY_AUTHORITY = "V50_SINGLE_LIVE_TELEMETRY_AUTHORITY_2026_10_08"
+print("V50 LOADED: DD live telemetry isolated; observation-time ordering enforced; DD/target engines unchanged", flush=True)
