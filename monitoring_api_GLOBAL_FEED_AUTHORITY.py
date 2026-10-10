@@ -1260,6 +1260,13 @@ def _monitoring_freshness_payload(stale_after_seconds=180):
         "never_synced_sample": never[:20],
     }
 
+@app.route("/livez", methods=["GET"])
+def process_liveness():
+    """Process probe: never query storage or change account lifecycle state."""
+    return ok({"service": "monitoring", "status": "alive",
+               "release": NAIRAPIPS_MONITORING_RELEASE})
+
+
 @app.route("/health")
 def health():
     try:
@@ -1680,7 +1687,7 @@ def admin_recall_wrong_assignment():
 
 
 
-def _bulk_rows(table_name, ids, select="*"):
+def _bulk_rows(table_name, ids, select="*", fail_on_error=False):
     """One bounded Supabase query for a set of IDs. Never N+1 inside discovery."""
     clean_ids = [str(x).strip() for x in (ids or []) if str(x or "").strip()]
     if not clean_ids:
@@ -1698,6 +1705,10 @@ def _bulk_rows(table_name, ids, select="*"):
         )
         return {str(r.get("id")): r for r in rows if r.get("id")}
     except Exception as e:
+        if fail_on_error:
+            # An unavailable query is not evidence that an account disappeared.
+            # Abort roster construction before lifecycle retirement can run.
+            raise RuntimeError(f"Authoritative roster lookup failed: {table_name}") from e
         print(f"FAST DISCOVERY BULK FETCH ERROR table={table_name}: {e}", flush=True)
         return {}
 
@@ -2331,21 +2342,25 @@ def _monitoring_registry_rows():
         "trader_accounts",
         [r.get("trader_account_id") for r in registry],
         select="*",
+        fail_on_error=True,
     )
     purchase_map = _bulk_rows(
         "challenge_purchases",
         [r.get("purchase_id") for r in registry],
         select="*",
+        fail_on_error=True,
     )
     trader_map = _bulk_rows(
         "traders",
         [r.get("trader_id") for r in registry],
         select="*",
+        fail_on_error=True,
     )
     pool_map = _bulk_rows(
         "mt5_pool",
         [r.get("mt5_pool_id") for r in registry],
         select="*",
+        fail_on_error=True,
     )
 
     registry_account_ids = [
