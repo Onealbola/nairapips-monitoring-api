@@ -87,7 +87,23 @@ lookup fails, instead of treating an outage as missing account records and
 running retirement logic. Four roster bulk queries use this behavior. Legacy
 non-roster callers preserve their existing fallback behavior. Regression tests
 cover database timeout, empty ID sets, and all four authoritative callers.
-This safety fix and the lightweight liveness endpoint are local changes only;
-they have not been published or deployed. They do not establish repair of the
+This safety fix and the lightweight liveness endpoint were published in
+addf0c5; the owner supplied a Render screenshot showing that commit Live. They do not establish repair of the
 production server stall. Research HTTP requests from this workspace failed with
 ProxyError; no external root-cause report has been verified.
+
+
+## Exact account activity correction — 2026-10-10
+
+Trade history used for inactivity must belong to the exact trader_account_id.
+A reused MT5 login must not import a predecessor account’s history. Legacy
+login-only history cannot authorize inactivity retirement.
+
+The owner confirmed that trade closing time restarts the seven-day clock for
+swing traders. Opening and closing timestamps count; ingestion and row update
+timestamps do not. Open positions retain protection. Automatic inactivity
+archival remains disabled because trade_history_available is still False.
+
+Four regression tests cover closing-time activity, reused login isolation, open
+position protection, and sync-time exclusion. The full local suite passed 58
+tests. This correction does not establish a fix for the production HTTP stall.

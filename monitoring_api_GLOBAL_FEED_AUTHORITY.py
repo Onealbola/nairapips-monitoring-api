@@ -2597,16 +2597,8 @@ def _monitoring_registry_rows():
                 seen.add(key)
                 rows.append(tr)
 
-        for tr in (trade_rows_by_login.get(login) or []):
-            key = (
-                str(tr.get("opened_at") or ""),
-                str(tr.get("closed_at") or ""),
-                str(tr.get("status") or ""),
-                str(tr.get("mt5_login") or ""),
-            )
-            if key not in seen:
-                seen.add(key)
-                rows.append(tr)
+        # A reused broker login is not an immutable account identity. Never
+        # merge a predecessor's history into the current account's idle clock.
 
         return rows
 
@@ -2633,6 +2625,8 @@ def _monitoring_registry_rows():
             if status in {"open", "opened", "active", "position_open"} and not closed_raw:
                 has_open = True
 
+            # Swing traders receive seven days after closing a position.
+            # Broker opening/closing times count; syncing and updates do not.
             for source in ("closed_at", "opened_at"):
                 dt = _parse_dt((tr or {}).get(source))
                 if dt is not None and (last_dt is None or dt > last_dt):
@@ -2719,6 +2713,18 @@ def _monitoring_registry_rows():
                         "error": repr(exc),
                     }
 
+            if exact_rows and any(
+                str(tr.get("trader_account_id") or "").strip() != rid
+                for tr in exact_rows
+            ):
+                # Legacy login-only history cannot prove which lifecycle traded.
+                # Keep monitoring until exact linkage is repaired; do not infer
+                # either recent activity or permission to archive from it.
+                return False, {
+                    "rule_applied": False,
+                    "reason": "trade_history_account_identity_unverified",
+                }
+
             if exact_rows:
                 # Feed the exact proof into the same established rolling activity
                 # evaluator. No DD, lifecycle, target, or shard logic is changed.
@@ -2752,7 +2758,7 @@ def _monitoring_registry_rows():
             }
 
         # Trader has traded before: rolling 7-day clock starts from the most
-        # recent OPEN/CLOSE trade timestamp.
+        # recent trade OPENING or CLOSING timestamp.
         if activity["has_ever_traded"]:
             last_dt = activity["last_activity_at"]
             if last_dt is None:
