@@ -11,6 +11,7 @@ import os, re, json
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
+from breach_read_transport import BreachReader, complete_breach_view
 
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
@@ -46,25 +47,29 @@ def bad(message, status=400):
     return res
 
 
-def require_main_api_admin():
+def require_main_api_admin(lightweight=False):
     """Validate the Admin bearer token with the main API before any recall write."""
     auth = str(request.headers.get("Authorization") or "").strip()
     if not auth.lower().startswith("bearer "):
         return None, bad("Admin authentication is required", 401)
     try:
         probe = urlrequest.Request(
-            MAIN_API_URL + "/admin_bootstrap",
+            MAIN_API_URL + ("/admin/auth_check" if lightweight else "/admin_bootstrap"),
             headers={"Authorization": auth, "Accept": "application/json"},
             method="GET",
         )
-        with urlrequest.urlopen(probe, timeout=20) as response:
+        with urlrequest.urlopen(probe, timeout=5 if lightweight else 20) as response:
             payload = json.loads(response.read().decode("utf-8") or "{}")
-        if payload.get("success") is False:
+        if not isinstance(payload, dict) or payload.get("success") is False or (lightweight and payload.get("success") is not True):
             return None, bad("Invalid or expired admin token", 401)
         return payload, None
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        print("RECALL ADMIN AUTH FAILED:", str(exc), flush=True)
+    except HTTPError as exc:
+        if lightweight:
+            return None, bad("Invalid or expired admin token" if exc.code in (401,403) else "Admin authentication service is unavailable", 401 if exc.code in (401,403) else 503)
         return None, bad("Admin authentication could not be verified", 401)
+    except (URLError, TimeoutError, ValueError) as exc:
+        print("RECALL ADMIN AUTH FAILED:", type(exc).__name__, flush=True)
+        return None, bad("Admin authentication could not be verified", 503 if lightweight else 401)
 
 
 def num(v, default=0.0):
@@ -446,7 +451,7 @@ def _rule_cache_set(key, value):
     _RULE_CACHE[key] = (time.time(), value)
     return value
 
-def resolve_account_rules(account, stage=None):
+def resolve_account_rules(account, stage=None, reader=None):
     """Resolve exact commercial rules for THIS trader_account.
 
     Authority order:
@@ -461,7 +466,7 @@ def resolve_account_rules(account, stage=None):
     account = account or {}
     stage = str(stage or account.get("stage") or "phase1").strip().lower()
     cache_key = "rules:" + str(account.get("id") or account.get("mt5_login") or "")
-    cached = _rule_cache_get(cache_key)
+    cached = _rule_cache_get(cache_key) if reader is None else None
     if cached:
         return dict(cached)
 
@@ -469,7 +474,7 @@ def resolve_account_rules(account, stage=None):
     plan = {}
     purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
     if purchase_id:
-        purchase = fetch_purchase_by_id(purchase_id) or {}
+        purchase = (reader("challenge_purchases", {"id":"eq."+purchase_id}, limit=1) or [{}])[0] if reader else (fetch_purchase_by_id(purchase_id) or {})
 
     plan_id = str(
         account.get("plan_id")
@@ -478,7 +483,7 @@ def resolve_account_rules(account, stage=None):
         or ""
     ).strip()
     if plan_id:
-        plan = fetch_plan_by_id(plan_id) or {}
+        plan = (reader("challenge_plans", {"id":"eq."+plan_id}, limit=1) or [{}])[0] if reader else (fetch_plan_by_id(plan_id) or {})
 
     def first_num(*values):
         for v in values:
@@ -560,7 +565,7 @@ def resolve_account_rules(account, stage=None):
         "plan_id": plan_id or None,
         "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"),
     }
-    return _rule_cache_set(cache_key, rules)
+    return rules if reader else _rule_cache_set(cache_key, rules)
 
 
 def target_for_stage(stage):
@@ -3733,11 +3738,12 @@ def disable_mt5_access():
 # It does NOT recalculate away a historical breach when the account later recovers.
 # ============================================================================
 @app.route("/breach_black_box", methods=["GET", "OPTIONS"])
+@complete_breach_view
 def breach_black_box():
     if request.method == "OPTIONS":
         return ok({})
 
-    _admin, auth_error = require_main_api_admin()
+    _admin, auth_error = require_main_api_admin(lightweight=True)
     if auth_error:
         return auth_error
 
@@ -3746,29 +3752,20 @@ def breach_black_box():
     if not account_id:
         return bad("Exact trader_account_id is required", 400)
 
-    account = get_account_by_id_any_status(account_id)
+    reader = BreachReader(SUPABASE_URL, SUPABASE_KEY)
+    account = (reader("trader_accounts", {"id":"eq."+account_id}, limit=1) or [None])[0]
     if not account:
         return bad("Exact trader account not found", 404)
     if trader_id and str(account.get("trader_id") or "") != trader_id:
         return bad("Trader/account ownership mismatch", 409)
 
     def _rows(table):
-        try:
-            return (
-                supabase.table(table)
-                .select("*")
-                .eq("trader_account_id", account_id)
-                .order("created_at", desc=False)
-                .execute().data or []
-            )
-        except Exception as exc:
-            print("MAGIC BLACK BOX READ ERROR", table, exc, flush=True)
-            return []
+        return reader(table, {"trader_account_id":"eq."+account_id})
 
     snapshots = _rows("monitoring_snapshots")
     events = _rows("monitoring_events")
 
-    rules = resolve_account_rules(account, account.get("stage"))
+    rules = resolve_account_rules(account, account.get("stage"), reader=reader)
     dd_limit = num(rules.get("dd_limit_percent"), 0.0)
     start = num(
         account.get("start_balance")
