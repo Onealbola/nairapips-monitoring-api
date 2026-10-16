@@ -81,6 +81,45 @@ class AdmissionTests(unittest.TestCase):
         connection.settimeout.assert_called_once_with(10)
 
 
+class DatabaseTransportTests(unittest.TestCase):
+    def test_sdk_preserves_auth_identity_and_bounded_request_timeouts(self):
+        import httpx
+        from monitoring_http import create_monitoring_database_client
+        seen=[]
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200,json=[{'id':'exact-account'}])
+        db=create_monitoring_database_client('https://fixture.supabase.co','fixture',
+                                             transport=httpx.MockTransport(handler))
+        try:
+            result=db.table('trader_accounts').select('id').eq('id','exact-account').limit(1).execute()
+            self.assertEqual(result.data,[{'id':'exact-account'}])
+            self.assertEqual(len(seen),1)
+            req=seen[0]
+            self.assertEqual(req.url.path,'/rest/v1/trader_accounts')
+            self.assertEqual(req.url.params['id'],'eq.exact-account')
+            self.assertEqual(req.headers['apikey'],'fixture')
+            self.assertEqual(req.headers['authorization'],'Bearer fixture')
+            self.assertEqual(req.extensions['timeout'],{'connect':2,'read':6,'write':6,'pool':2})
+        finally:db.postgrest.session.close()
+
+    def test_disconnected_write_is_not_automatically_replayed(self):
+        import httpx
+        from monitoring_http import create_monitoring_database_client
+        seen=[]
+        def handler(request):
+            seen.append(request)
+            raise httpx.RemoteProtocolError('Server disconnected')
+        db=create_monitoring_database_client('https://fixture.supabase.co','fixture',
+                                             transport=httpx.MockTransport(handler))
+        try:
+            with self.assertRaises(Exception):
+                db.table('trader_accounts').update({'monitoring_enabled':True}).eq('id','fixture').execute()
+            self.assertEqual(len(seen),1)
+            self.assertEqual(seen[0].method,'PATCH')
+        finally:db.postgrest.session.close()
+
+
 class GunicornAvailabilityTests(unittest.TestCase):
     def test_slow_dependencies_cannot_starve_real_health_requests(self):
         with tempfile.TemporaryDirectory() as directory:

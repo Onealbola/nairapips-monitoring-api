@@ -5,8 +5,7 @@ NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from supabase import create_client, ClientOptions
-from monitoring_http import MonitoringAdmission
+from monitoring_http import MonitoringAdmission, create_monitoring_database_client
 from datetime import datetime, timezone, timedelta
 import os, re, json
 from urllib import request as urlrequest
@@ -32,8 +31,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 # The SDK default is 120 seconds per database call. Bound dependency waits;
 # storage failures remain failures and never become empty/terminal evidence.
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY,
-                         options=ClientOptions(postgrest_client_timeout=6))
+supabase = create_monitoring_database_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def now_iso():
@@ -1277,6 +1275,7 @@ def process_liveness():
     return ok({"service": "monitoring", "status": "alive",
                "release": NAIRAPIPS_MONITORING_RELEASE,
                "http_capacity_release": "V51_BOUNDED_MONITORING_HTTP_2026_10_16",
+               "database_transport": "HTTP1_BOUNDED_V52",
                "commit": os.environ.get("RENDER_GIT_COMMIT")})
 
 

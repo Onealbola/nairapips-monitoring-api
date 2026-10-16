@@ -145,3 +145,13 @@ rejection without starting a mutation, and recovery after the fixture releases.
 The production app is not imported for this test and no production account is
 used. Follow deployment with readiness requests and exact-account observation
 checks; do not equate successful deployment with repaired MT5 connectivity.
+
+Live validation after 033c259 confirmed `/livez` and `/` HTTP200 and a successful
+47-account roster. A separate live diagnostic also returned `Server disconnected`.
+The SDK constructs HTTP/2 clients by default. The follow-up database transport
+uses authenticated HTTP/1.1, at most eight database connections, no cached idle
+connections, six-second read/write waits and two-second connect/pool waits.
+It never automatically replays a disconnected mutation. SDK query/filter/auth
+behavior is preserved and exercised with an HTTP transport fixture. This removes
+the shared HTTP/2/idle-connection dependency; it does not establish that HTTP/2
+was the sole source of the original availability failure.

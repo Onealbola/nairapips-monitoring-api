@@ -82,3 +82,19 @@ class MonitoringAdmission:
                 if roster_acquired:
                     self.roster_slot.release()
                 self.slots.release()
+
+
+def create_monitoring_database_client(url, key, transport=None):
+    """Bound database I/O without sharing HTTP/2 streams or stale idle sockets.
+
+    No automatic transport retry: an uncertain financial write must not be
+    replayed. Auth headers and schema-compatible queries remain SDK-managed.
+    """
+    import httpx
+    from supabase import create_client, ClientOptions
+    http = httpx.Client(http2=False,
+        timeout=httpx.Timeout(6, connect=2, pool=2),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=0),
+        transport=transport)
+    return create_client(url, key, options=ClientOptions(
+        httpx_client=http, postgrest_client_timeout=6))
