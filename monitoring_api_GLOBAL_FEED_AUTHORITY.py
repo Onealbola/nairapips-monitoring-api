@@ -5,7 +5,8 @@ NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from supabase import create_client
+from supabase import create_client, ClientOptions
+from monitoring_http import MonitoringAdmission
 from datetime import datetime, timezone, timedelta
 import os, re, json
 from urllib import request as urlrequest
@@ -14,6 +15,7 @@ from urllib.parse import urlencode
 from breach_read_transport import BreachReader, complete_breach_view
 
 app = Flask(__name__)
+app.wsgi_app = MonitoringAdmission(app.wsgi_app)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
 CORS(app)
 # V23 removed duplicate NAIRAPIPS_MONITORING_RELEASE override
@@ -28,7 +30,10 @@ TERMINAL_RETIRE_AFTER_DAYS = int(os.getenv("NAIRAPIPS_TERMINAL_RETIRE_AFTER_DAYS
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# The SDK default is 120 seconds per database call. Bound dependency waits;
+# storage failures remain failures and never become empty/terminal evidence.
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY,
+                         options=ClientOptions(postgrest_client_timeout=6))
 
 
 def now_iso():
@@ -1268,8 +1273,11 @@ def _monitoring_freshness_payload(stale_after_seconds=180):
 @app.route("/livez", methods=["GET"])
 def process_liveness():
     """Process probe: never query storage or change account lifecycle state."""
+    import os
     return ok({"service": "monitoring", "status": "alive",
-               "release": NAIRAPIPS_MONITORING_RELEASE})
+               "release": NAIRAPIPS_MONITORING_RELEASE,
+               "http_capacity_release": "V51_BOUNDED_MONITORING_HTTP_2026_10_16",
+               "commit": os.environ.get("RENDER_GIT_COMMIT")})
 
 
 @app.route("/health")
