@@ -107,3 +107,51 @@ archival remains disabled because trade_history_available is still False.
 Four regression tests cover closing-time activity, reused login isolation, open
 position protection, and sync-time exclusion. The full local suite passed 58
 tests. This correction does not establish a fix for the production HTTP stall.
+
+## HTTP availability repair — 16 October 2026
+
+Render Events reported repeated `dial tcp ...:10000: i/o timeout while running
+ your code`. This establishes availability failure, not OOM or a particular
+blocked stack. The installed Supabase client's default database timeout was
+120 seconds. The repository previously had no Gunicorn configuration.
+
+`gunicorn.conf.py` now supplies two gthread workers with eight threads each,
+keeps the 30-second worker watchdog, and bounds accepted connection capacity.
+The startup hook handles an explicit sync-worker/thread CLI override and
+refreshes Gunicorn's cached worker class before spawning workers. Gunicorn
+loads this configuration automatically when started from the repository root;
+an explicit alternative `--config` or different working directory must be
+checked if the deployment does not emit the startup marker below.
+
+`monitoring_http.py` admits at most six non-probe requests per worker and one
+roster refresh per worker. Root and `/livez` probes retain capacity. Busy calls
+return HTTP503 with `success=false`, `operation_started=false`, and no roster
+`data`; collectors must retain the last good population and retry. No account
+activation, retirement, or financial decision is made by admission. Response
+writes are chunked and client socket idle waits are limited to ten seconds.
+Supabase database waits are limited to six seconds rather than 120 seconds.
+Failed verification still fails closed; database errors do not prove a missing
+account, a breach, a phase pass, or an empty population.
+
+Startup logs identify `NP MONITOR HTTP V51`, actual class/threads/bind and request
+slots. `/livez` reports `http_capacity_release` and `RENDER_GIT_COMMIT` without
+querying storage. It is a process probe, **not** proof of broker freshness.
+`/monitoring_health` remains the separate freshness diagnostic. No broker
+balances, target/DD rules, inactivity clocks, or lifecycle functions changed.
+
+Validation uses a real local Gunicorn process with six blocked fixture requests,
+an explicit legacy sync/one-thread override, concurrent health probes, overload
+rejection without starting a mutation, and recovery after the fixture releases.
+The production app is not imported for this test and no production account is
+used. Follow deployment with readiness requests and exact-account observation
+checks; do not equate successful deployment with repaired MT5 connectivity.
+
+Live validation after 033c259 confirmed `/livez` and `/` HTTP200 and a successful
+47-account roster. A separate live diagnostic also returned `Server disconnected`.
+The SDK constructs HTTP/2 clients by default. The follow-up database transport
+uses authenticated HTTP/1.1, at most eight database connections, no cached idle
+connections, six-second read/write waits and two-second connect/pool waits.
+It never automatically replays a disconnected mutation. SDK query/filter/auth
+behavior is preserved and exercised with an HTTP transport fixture. This removes
+the shared HTTP/2/idle-connection dependency; it does not establish that HTTP/2
+was the sole source of the original availability failure.
