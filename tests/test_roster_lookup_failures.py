@@ -24,6 +24,6 @@ class LookupTests(unittest.TestCase):
     def test_every_roster_bulk_read_aborts_on_failure(self):
         f=next(n for n in self.tree.body if isinstance(n,ast.FunctionDef) and n.name=='_monitoring_registry_rows')
         calls=[n for n in ast.walk(f) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='_bulk_rows']
-        self.assertEqual(len(calls),4)
+        self.assertEqual(len(calls),5)
         for call in calls:
             self.assertTrue(any(k.arg=='fail_on_error' and isinstance(k.value,ast.Constant) and k.value.value is True for k in call.keywords))

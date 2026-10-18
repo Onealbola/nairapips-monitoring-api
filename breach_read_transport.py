@@ -13,7 +13,7 @@ class BreachReader:
         self.headers={'apikey':key,'Authorization':'Bearer '+key}
         self.deadline=time.monotonic()+seconds
     def __call__(self,table,filters,limit=None):
-        if table not in {'trader_accounts','challenge_purchases','challenge_plans','monitoring_snapshots','monitoring_events'}:
+        if table not in {'trader_accounts','challenge_purchases','challenge_plans','monitoring_snapshots','monitoring_events','np_package_contracts'}:
             raise BreachReadUnavailable('Unsupported evidence table')
         rows=[]
         while True:

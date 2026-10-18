@@ -12,6 +12,7 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from breach_read_transport import BreachReader, complete_breach_view
+from package_account_rules import has_package_binding, load_package_rules, PackageContractReader, PackageBindingError, package_roster_fields
 
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "MT5_BALANCE_INPUT_NORMALIZED_FINAL_2026_07_23"
@@ -464,6 +465,8 @@ def resolve_account_rules(account, stage=None, reader=None):
     into a guessed pass/breach rule.
     """
     account = account or {}
+    if account.get("package_contract_id") or account.get("package_rules_hash"):
+        return load_package_rules(account, reader or PackageContractReader(SUPABASE_URL, SUPABASE_KEY), stage=stage)
     stage = str(stage or account.get("stage") or "phase1").strip().lower()
     cache_key = "rules:" + str(account.get("id") or account.get("mt5_login") or "")
     cached = _rule_cache_get(cache_key) if reader is None else None
@@ -861,6 +864,8 @@ def alert_once(account, event_type, title, message, severity="info", snapshot=No
 def apply_intelligence(account, snapshot):
     if not account:
         return None
+    if account.get("package_contract_id") or account.get("package_rules_hash"):
+        raise PackageBindingError("Package observations require the immutable package lifecycle adapter; legacy target decisions are blocked")
     if not is_active_monitoring_account(account):
         print("MONITORING SNAPSHOT IGNORED FOR NON-ACTIVE ACCOUNT:", {"account_id": account.get("id"), "trader_id": account.get("trader_id"), "mt5_login": account.get("mt5_login"), "account_status": account.get("account_status")}, flush=True)
         return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "ignored": True, "reason": "account_not_active_for_monitoring"}
@@ -1755,9 +1760,12 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
     return True, "eligible_exact_active_trader_account"
 
 
-def _fast_rule_values(account, purchase=None, plan=None):
+def _fast_rule_values(account, purchase=None, plan=None, package_contract=None):
     """Resolve exact monitoring rules without guessed commercial fallbacks."""
     account = account or {}
+    if account.get("package_contract_id") or account.get("package_rules_hash"):
+        reader = (lambda table,filters,limit=1:[package_contract]) if package_contract is not None else PackageContractReader(SUPABASE_URL, SUPABASE_KEY)
+        return load_package_rules(account,reader)
     purchase = purchase or {}
     plan = plan or {}
     stage = str(account.get("stage") or account.get("phase") or "phase1").strip().lower()
@@ -2349,6 +2357,7 @@ def _monitoring_registry_rows():
         select="*",
         fail_on_error=True,
     )
+    package_map = _bulk_rows("np_package_contracts", [a.get("package_contract_id") for a in account_map.values() if a.get("package_contract_id")], fail_on_error=True)
     purchase_map = _bulk_rows(
         "challenge_purchases",
         [r.get("purchase_id") for r in registry],
@@ -3036,7 +3045,11 @@ def _monitoring_registry_rows():
             ["mt5_master_password", "mt5_password", "master_password", "password"],
         )
 
-        rule_values = _fast_rule_values(account, purchase, {})
+        try:
+            rule_values = _fast_rule_values(account, purchase, {}, package_map.get(str(account.get("package_contract_id") or ""), {}))
+        except PackageBindingError:
+            rejected.append({"account_id":account_id,"reason":"immutable_package_contract_invalid"})
+            continue
 
         live.append({
             "id": account_id,
@@ -3072,6 +3085,7 @@ def _monitoring_registry_rows():
                 "master": len(master_candidates),
             },
             "account_size": num(account.get("account_size") or account.get("start_balance")),
+            **({key:rule_values[key] for key in ("package_contract_id","package_rules_hash","package_contract","purchase_id","drawdown_type","package_account_started_at")} if rule_values.get("package_contract_id") else {}),
             "dd_limit_percent": rule_values["dd_limit_percent"],
             "dd_authority_present": rule_values["dd_authority_present"],
             "dd_authority_source": rule_values.get("dd_authority_source") or "authority_missing",
