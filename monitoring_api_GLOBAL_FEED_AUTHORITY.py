@@ -2,6 +2,7 @@
 # V47 2026-10-07: schema-only fix — write trader_accounts.breached_at, never nonexistent breach_at. DD/target/roster logic unchanged.
 # V17: breach persistence constraint compatibility (breach_reason + breach_at + breach_equity_level)
 NAIRAPIPS_MONITORING_RELEASE = "V45_FAST_ROSTER_ACTIVITY_PROOF_2026_10_07"
+import netrc as _np_netrc_preload
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -468,6 +469,7 @@ def resolve_account_rules(account, stage=None, reader=None):
     into a guessed pass/breach rule.
     """
     account = account or {}
+    from equity_drawdown import account_mode
     if account.get("package_contract_id") or account.get("package_rules_hash"):
         return load_package_rules(account, reader or PackageContractReader(SUPABASE_URL, SUPABASE_KEY), stage=stage)
     stage = str(stage or account.get("stage") or "phase1").strip().lower()
@@ -562,6 +564,7 @@ def resolve_account_rules(account, stage=None, reader=None):
 
     rules = {
         "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "drawdown_type": account_mode(account, purchase),
         "dd_authority_present": bool(dd_authority_present),
         "target_percent": float(target) if target is not None else 0.0,
         "target_authority_present": bool(target_authority_present),
@@ -950,6 +953,27 @@ def apply_intelligence(account, snapshot):
     dd_remaining = round(max(dd_limit_percent - current_dd_precise, 0), 2) if dd_authority_present else 0.0
     zone = risk_zone(current_dd_precise, dd_limit_percent) if dd_authority_present else "authority_missing"
 
+    from equity_drawdown import DrawdownStateStore
+    trailing_state = None
+    if str(rules.get("drawdown_type", "STATIC")).upper() == "TRAILING":
+        __import__("equity_drawdown").verify_ingest(request)
+        import requests
+        purchase = fetch_purchase_by_id(account.get("purchase_id")) if account.get("purchase_id") else {}
+        trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(
+            dict(account, dd_limit_percent=dd_limit_percent), purchase, equity, snapshot.get("timestamp") or snapshot.get("observed_at"), peak_equity=snapshot.get("trailing_highest_equity"))
+        if trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(snapshot.get("timestamp") or snapshot.get("observed_at")).isoformat():
+            return {"account_id": account.get("id"), "ignored": True, "account_write_ok": True, "reason": "out_of_order_trailing_observation"}
+        highest = float(trailing_state["highest_equity"])
+        breach_level = float(trailing_state["drawdown_floor"])
+        current_dd_precise = float(trailing_state["drawdown_percent"])
+        current_dd = round(current_dd_precise, 2)
+        current_dd_used = float(trailing_state["used_percent"])
+        worst_dd_used = float(trailing_state["worst_used_percent"])
+        worst_dd_precise = worst_dd_used * dd_limit_percent / 100
+        worst_dd = round(worst_dd_precise, 2)
+        dd_remaining = max(0, dd_limit_percent-current_dd_precise)
+        zone = risk_zone(current_dd_precise, dd_limit_percent)
+
     # Current payout/closed profit follows the actual MT5 balance.
     # highest_equity remains pass-target evidence only.
     profit = round(current_balance - start, 2) if start else 0.0
@@ -966,8 +990,8 @@ def apply_intelligence(account, snapshot):
     # A real static DD breach must never be erased because the account also touched
     # its profit target. Use the worst evidence seen while this account is still live.
     breached_by_equity = bool(dd_authority_present and start and equity <= breach_level)
-    breached_by_balance = bool(dd_authority_present and start and current_balance <= breach_level)
-    breached_by_recorded_low = bool(dd_authority_present and start and lowest <= breach_level)
+    breached_by_balance = bool(trailing_state is None and dd_authority_present and start and current_balance <= breach_level)
+    breached_by_recorded_low = bool(trailing_state["breached"] if trailing_state is not None else dd_authority_present and start and lowest <= breach_level)
     terminal_breach_recorded = bool(account.get("breach_at") or account.get("breached_at"))
     breached = bool(terminal_breach_recorded or breached_by_equity or breached_by_balance or breached_by_recorded_low)
 
@@ -1022,12 +1046,12 @@ def apply_intelligence(account, snapshot):
         update["account_status"] = status
         update["monitoring_enabled"] = False
         update["archived_at"] = now_iso()
-        update["archive_reason"] = snapshot.get("reason") or ("Static drawdown breached" if breached else "Target reached")
+        update["archive_reason"] = snapshot.get("reason") or ("Drawdown breached" if breached else "Target reached")
         if breached:
             _breach_ts = account.get("breach_at") or account.get("breached_at") or now_iso()
             update["breached_at"] = _breach_ts
             update["breach_reason"] = snapshot.get("reason") or (
-                f"Static {dd_limit_percent:g}% drawdown breached. "
+                f"{rules.get('drawdown_type', 'STATIC')} {dd_limit_percent:g}% drawdown breached. "
                 f"Lowest/current evidence reached {min(lowest, equity, current_balance):,.2f} "
                 f"against breach level {breach_level:,.2f}."
             )
@@ -1167,14 +1191,14 @@ def apply_intelligence(account, snapshot):
     if breached:
         alert_once(
             account, "breached", "ACCOUNT BREACHED",
-            f"MT5 {account.get('mt5_login')} hit/below its static {dd_limit_percent:g}% DD level {breach_level:,.2f}.",
+            f"MT5 {account.get('mt5_login')} hit/below its {rules.get('drawdown_type', 'STATIC')} {dd_limit_percent:g}% DD level {breach_level:,.2f}.",
             "critical", event
         )
     elif target_hit:
         next_label = "Funded" if (stage == "phase1" and rules.get("one_phase")) else "next-stage"
         alert_once(account, "phase_passed", f"{stage.upper()} PASSED", f"MT5 {account.get('mt5_login')} reached {target}% target. Awaiting {next_label} MT5 assignment.", "success", event)
     elif current_dd >= dd_limit_percent * 0.50:
-        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} static DD is {current_dd}% of a {dd_limit_percent:g}% limit.", "warning", event)
+        alert_once(account, "dd_warning", "DRAWDOWN WARNING", f"MT5 {account.get('mt5_login')} {rules.get('drawdown_type', 'STATIC')} DD is {current_dd}% of a {dd_limit_percent:g}% limit.", "warning", event)
 
     return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "zone": zone, "target_hit": target_hit, "breached": breached, "profit_percent": profit_percent, "current_dd": current_dd, "dd_used_percent": current_dd_used, "account_write_ok": account_write_ok, "account_write_mode": account_write_mode, "trader_write_ok": trader_write_ok, "persisted_account_status": (persisted_account or {}).get("account_status"), "persisted_balance": (persisted_account or {}).get("current_balance"), "persisted_equity": (persisted_account or {}).get("current_equity")}
 
@@ -1770,6 +1794,7 @@ def _quiet_monitoring_eligibility(account, purchase=None, mt5_pool=None):
 def _fast_rule_values(account, purchase=None, plan=None, package_contract=None):
     """Resolve exact monitoring rules without guessed commercial fallbacks."""
     account = account or {}
+    from equity_drawdown import account_mode
     if account.get("package_contract_id") or account.get("package_rules_hash"):
         reader = (lambda table,filters,limit=1:[package_contract]) if package_contract is not None else PackageContractReader(SUPABASE_URL, SUPABASE_KEY)
         return load_package_rules(account,reader)
@@ -1856,6 +1881,7 @@ def _fast_rule_values(account, purchase=None, plan=None, package_contract=None):
 
     return {
         "dd_limit_percent": float(dd_limit) if dd_limit is not None else 0.0,
+        "drawdown_type": account_mode(account, purchase),
         "dd_authority_present": bool(dd_limit is not None),
         "dd_authority_source": dd_source,
         "target_percent": float(target) if target is not None else 0.0,
@@ -3093,6 +3119,9 @@ def _monitoring_registry_rows():
             },
             "account_size": num(account.get("account_size") or account.get("start_balance")),
             **({key:rule_values[key] for key in ("package_contract_id","package_rules_hash","package_contract","purchase_id","drawdown_type","package_account_started_at")} if rule_values.get("package_contract_id") else {}),
+            "drawdown_type": rule_values.get("drawdown_type", "STATIC"),
+            "drawdown_rules": __import__("equity_drawdown").spec(dict(account, drawdown_type=rule_values.get("drawdown_type", "STATIC"), dd_limit_percent=rule_values["dd_limit_percent"])) if str(rule_values.get("drawdown_type", "STATIC")).upper()=="TRAILING" and not rule_values.get("package_contract_id") else None,
+            "account_started_at": account.get("started_at") or account.get("created_at"),
             "dd_limit_percent": rule_values["dd_limit_percent"],
             "dd_authority_present": rule_values["dd_authority_present"],
             "dd_authority_source": rule_values.get("dd_authority_source") or "authority_missing",
@@ -3552,6 +3581,19 @@ def monitoring_snapshot():
         if _bal <= 0 or _eq <= 0 or _start <= 0:
             return ok({"ignored": True, "reason": "dd_live_invalid_financial_values", "account_id": account_id}, "DD live telemetry quarantined")
 
+        from equity_drawdown import account_mode, DrawdownStateStore
+        _purchase = None
+        if account_mode(account) == "TRAILING":
+            __import__("equity_drawdown").verify_ingest(request)
+            import requests
+            _state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(account, _purchase, _eq, _obs.isoformat(), peak_equity=data.get("trailing_highest_equity"))
+            if _state["last_observed_at"] != _obs.isoformat():
+                return ok({"ignored": True, "reason": "out_of_order_trailing_observation"})
+            data = dict(data, drawdown_percent=float(_state["drawdown_percent"]),
+                dd_used_percent=float(_state["used_percent"]), max_drawdown_used=float(_state["used_percent"]),
+                breach_equity_level=float(_state["drawdown_floor"]), highest_equity=float(_state["highest_equity"]),
+                risk_zone="breached" if _state["breached"] else risk_zone(float(_state["drawdown_percent"]),float(account["dd_limit_percent"])))
+
         _profit = round(_bal - _start, 2)
         _profit_pct = round((_profit / _start) * 100.0, 4) if _start else 0.0
         _row = {
@@ -3577,6 +3619,8 @@ def monitoring_snapshot():
             "intelligence_event_id": f"{account.get('id')}:{data.get('timestamp')}",
             "created_at": _obs.isoformat(),
         }
+        if account_mode(account) == "TRAILING":
+            _row["highest_equity"] = data["highest_equity"]
         _saved = safe_insert("monitoring_snapshots", _row)
         if not _saved:
             return bad("Live DD telemetry snapshot persistence failed", 500)
@@ -4415,3 +4459,9 @@ def _np_recall_kick_exact_replacement_v9(auth_header, trader_id, journey_id, ent
 
 NAIRAPIPS_V50_SINGLE_LIVE_TELEMETRY_AUTHORITY = "V50_SINGLE_LIVE_TELEMETRY_AUTHORITY_2026_10_08"
 print("V50 LOADED: DD live telemetry isolated; observation-time ordering enforced; DD/target engines unchanged", flush=True)
+
+
+@app.get('/drawdown_version')
+def drawdown_version():
+    from equity_drawdown import RELEASE
+    return jsonify(success=True,release=RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity')
