@@ -4464,4 +4464,4 @@ print("V50 LOADED: DD live telemetry isolated; observation-time ordering enforce
 @app.get('/drawdown_version')
 def drawdown_version():
     from equity_drawdown import RELEASE
-    return jsonify(success=True,release=RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity')
+    return jsonify(success=True,release=RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))
