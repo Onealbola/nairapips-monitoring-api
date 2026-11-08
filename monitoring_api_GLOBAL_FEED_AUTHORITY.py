@@ -4461,7 +4461,19 @@ NAIRAPIPS_V50_SINGLE_LIVE_TELEMETRY_AUTHORITY = "V50_SINGLE_LIVE_TELEMETRY_AUTHO
 print("V50 LOADED: DD live telemetry isolated; observation-time ordering enforced; DD/target engines unchanged", flush=True)
 
 
-@app.get('/drawdown_version')
+@app.route("/drawdown_version", methods=["GET", "POST"])
 def drawdown_version():
+    # POST verifies the deployed collector credential without reading or writing accounts.
+    if request.method == "POST":
+        from equity_drawdown import RELEASE, verify_ingest
+        try:
+            verify_ingest(request)
+        except ValueError:
+            response = jsonify(success=False, collector_auth_verified=False)
+            response.headers["Cache-Control"] = "no-store"
+            return response, 403
+        response = jsonify(success=True, release=RELEASE, collector_auth_verified=True)
+        response.headers["Cache-Control"] = "no-store"
+        return response
     from equity_drawdown import RELEASE
     return jsonify(success=True,release=RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))
