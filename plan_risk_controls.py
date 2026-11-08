@@ -108,6 +108,7 @@ def daily_percent(row):
 
 def inherit(source, row):
     terms = frozen_terms(row)
+    source = __import__('withdrawal_controls').inherit(source,row)
     return freeze(source, terms) if terms else source
 
 
