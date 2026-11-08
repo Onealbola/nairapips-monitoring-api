@@ -955,12 +955,12 @@ def apply_intelligence(account, snapshot):
 
     from equity_drawdown import DrawdownStateStore
     trailing_state = None
-    if str(rules.get("drawdown_type", "STATIC")).upper() == "TRAILING":
+    if str(rules.get("drawdown_type", "STATIC")).upper() == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
         __import__("equity_drawdown").verify_ingest(request)
         import requests
         purchase = fetch_purchase_by_id(account.get("purchase_id")) if account.get("purchase_id") else {}
         trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(
-            dict(account, dd_limit_percent=dd_limit_percent), purchase, equity, snapshot.get("timestamp") or snapshot.get("observed_at"), peak_equity=snapshot.get("trailing_highest_equity"))
+            dict(account, dd_limit_percent=dd_limit_percent), purchase, equity, snapshot.get("timestamp") or snapshot.get("observed_at"), peak_equity=snapshot.get("trailing_highest_equity"), balance=current_balance, daily_realised=snapshot.get("daily_realised"))
         if trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(snapshot.get("timestamp") or snapshot.get("observed_at")).isoformat():
             return {"account_id": account.get("id"), "ignored": True, "account_write_ok": True, "reason": "out_of_order_trailing_observation"}
         highest = float(trailing_state["highest_equity"])
@@ -3120,7 +3120,9 @@ def _monitoring_registry_rows():
             "account_size": num(account.get("account_size") or account.get("start_balance")),
             **({key:rule_values[key] for key in ("package_contract_id","package_rules_hash","package_contract","purchase_id","drawdown_type","package_account_started_at")} if rule_values.get("package_contract_id") else {}),
             "drawdown_type": rule_values.get("drawdown_type", "STATIC"),
-            "drawdown_rules": __import__("equity_drawdown").spec(dict(account, drawdown_type=rule_values.get("drawdown_type", "STATIC"), dd_limit_percent=rule_values["dd_limit_percent"])) if str(rule_values.get("drawdown_type", "STATIC")).upper()=="TRAILING" and not rule_values.get("package_contract_id") else None,
+            "journey_source": account.get("journey_source"),
+            "daily_drawdown": float(__import__("plan_risk_controls").daily_percent(account)),
+            "drawdown_rules": __import__("equity_drawdown").spec(dict(account, drawdown_type=rule_values.get("drawdown_type", "STATIC"), dd_limit_percent=rule_values["dd_limit_percent"])) if (str(rule_values.get("drawdown_type", "STATIC")).upper()=="TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0) and not rule_values.get("package_contract_id") else None,
             "account_started_at": account.get("started_at") or account.get("created_at"),
             "dd_limit_percent": rule_values["dd_limit_percent"],
             "dd_authority_present": rule_values["dd_authority_present"],
@@ -3566,7 +3568,7 @@ def monitoring_snapshot():
     # One MT5 observation -> one lightweight evidence insert. Breach/close remains in
     # DD Police + /disable_mt5_access; target/progression remains with Operations.
     _source = str(data.get("source") or "").strip().lower()
-    if _source.startswith("dd_police_live_mt5_"):
+    if _source.startswith(("dd_police_live_mt5_","dd_police_daily_v1_shard_")):
         _obs = _parse_iso_ts(data.get("timestamp"))
         _now = datetime.now(timezone.utc)
         if _obs is None:
@@ -3583,10 +3585,10 @@ def monitoring_snapshot():
 
         from equity_drawdown import account_mode, DrawdownStateStore
         _purchase = None
-        if account_mode(account) == "TRAILING":
+        if account_mode(account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
             __import__("equity_drawdown").verify_ingest(request)
             import requests
-            _state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(account, _purchase, _eq, _obs.isoformat(), peak_equity=data.get("trailing_highest_equity"))
+            _state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(account, _purchase, _eq, _obs.isoformat(), peak_equity=data.get("trailing_highest_equity"),balance=_bal,daily_realised=data.get("daily_realised"))
             if _state["last_observed_at"] != _obs.isoformat():
                 return ok({"ignored": True, "reason": "out_of_order_trailing_observation"})
             data = dict(data, drawdown_percent=float(_state["drawdown_percent"]),
@@ -3619,7 +3621,7 @@ def monitoring_snapshot():
             "intelligence_event_id": f"{account.get('id')}:{data.get('timestamp')}",
             "created_at": _obs.isoformat(),
         }
-        if account_mode(account) == "TRAILING":
+        if account_mode(account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
             _row["highest_equity"] = data["highest_equity"]
         _saved = safe_insert("monitoring_snapshots", _row)
         if not _saved:
@@ -3658,6 +3660,23 @@ def disable_mt5_access():
         return bad("Exact trader account not found or MT5 ownership evidence mismatched", 404)
     status = str(data.get("status") or "breached").lower()
     reason = data.get("reason") or "MT5 access disabled by monitoring engine"
+
+    if __import__('plan_risk_controls').daily_percent(account) > 0:
+        try:
+            from equity_drawdown import verify_ingest, read_saved_state
+            if 'breach' in status:
+                verify_ingest(request)
+                proof = __import__('plan_risk_controls').daily_breach_proof(account,data)
+                data = dict(data, breach_equity_level=float(proof['drawdown_floor']), dd_used_percent=float(proof['used_percent']))
+                reason = 'DAILY_DRAWDOWN_BREACH' if float(proof.get('daily_used_percent',0)) >= 100 else 'MAX_DRAWDOWN_BREACH'
+            else:
+                import requests
+                proof = read_saved_state(requests,SUPABASE_URL,SUPABASE_KEY,account,None)
+                age = (datetime.now(timezone.utc)-__import__('equity_drawdown').timestamp(proof['last_observed_at'])).total_seconds()
+                if account.get('breached_at') or proof['breached'] or not -5 <= age <= 180:
+                    return bad('Daily risk state does not permit a non-breach transition',403)
+        except Exception:
+            return bad('Daily risk evidence could not be verified',403)
 
     # V11 PASS-LOCK COMPATIBILITY.
     # Engine event names are evidence, not trader_accounts.account_status values.
@@ -4476,4 +4495,4 @@ def drawdown_version():
         response.headers["Cache-Control"] = "no-store"
         return response
     from equity_drawdown import RELEASE
-    return jsonify(success=True,release=RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))
+    return jsonify(success=True,release=RELEASE,plan_controls_release=__import__('plan_risk_controls').RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))

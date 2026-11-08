@@ -64,6 +64,10 @@ def spec(account, purchase=None):
     if (not result['mt5_login'] or result['stage'] not in ('phase1', 'phase2', 'funded')
             or number(result['capital']) <= 0 or not 0 < number(result['limit']) < 100):
         raise ValueError('Exact account risk terms are required')
+    from plan_risk_controls import daily_percent
+    daily = daily_percent(account)
+    if daily > 0:
+        result['daily_drawdown'] = str(daily.normalize())
     return result
 
 
@@ -76,7 +80,7 @@ def initial(rules):
         last_observed_at=None, breached=False, first_breach=None, worst_used_percent='0')
 
 
-def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=None):
+def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=None, daily_realised=None):
     """Evaluate in observation order; a low before a high cannot breach later."""
     if previous['rules_hash'] != fingerprint(rules):
         raise ValueError('Account identity or frozen rules changed')
@@ -89,7 +93,7 @@ def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=Non
         raise ValueError('Saved watermark or risk usage is invalid')
     if previous['breached']:
         first = previous.get('first_breach')
-        if not isinstance(first, dict) or number(first['equity']) > number(first['floor']):
+        if not isinstance(first, dict) or (number(first['equity']) if mode(rules['drawdown_type']) == 'TRAILING' else min(number(first['equity']), number(first.get('balance',first['equity'])))) > number(first['floor']):
             raise ValueError('Saved terminal breach evidence is invalid')
         timestamp(first['observed_at'])
     state = copy.deepcopy(previous)
@@ -101,9 +105,31 @@ def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=Non
     allowance = capital * limit / 100
     reference = high if mode(rules['drawdown_type']) == 'TRAILING' else capital
     floor = reference - allowance
-    damage = max(Decimal(0), reference - equity)
+    risk_value = equity if mode(rules['drawdown_type']) == 'TRAILING' or balance is None else min(equity, number(balance))
+    damage = max(Decimal(0), reference - risk_value)
     used = damage / allowance * 100
-    breach = equity <= floor
+    overall_breach = risk_value <= floor
+    daily_breach = False
+    daily_enabled = number(rules.get('daily_drawdown', 0)) > 0
+    if daily_enabled:
+        state['overall_floor'] = str(floor)
+    if daily_enabled and (balance is None or daily_realised is None) and risk_value > floor:
+        raise ValueError('Verified daily trading history and balance are required')
+    if daily_enabled and balance is not None and daily_realised is not None:
+        from plan_risk_controls import WAT
+        daily_allowance = capital * number(rules['daily_drawdown']) / 100
+        realised = number(daily_realised)
+        daily_floor = number(balance) - realised - daily_allowance
+        daily_loss = max(Decimal(0), realised * -1 + number(balance) - equity)
+        daily_used = daily_loss / daily_allowance * 100
+        daily_breach = equity <= daily_floor
+        state.update(daily_floor=str(daily_floor), daily_realised=str(realised),
+            daily_day=observed.astimezone(WAT).date().isoformat(),
+            daily_loss_percent=str(daily_loss / capital * 100), daily_used_percent=str(daily_used))
+        if daily_floor > floor:
+            floor = daily_floor
+        used = max(used, daily_used)
+    breach = overall_breach or daily_breach
     state.update(highest_equity=str(high), equity=str(equity), drawdown_floor=str(floor),
         drawdown_amount=str(damage), drawdown_percent=str(damage / capital * 100),
         used_percent=str(used), worst_used_percent=str(max(number(previous['worst_used_percent']), used)),
@@ -134,7 +160,7 @@ class EquityDrawdownJournal:
     def __init__(self, directory):
         self.directory = Path(directory)
 
-    def assess(self, account, equity, observed_at, now=None, balance=None):
+    def assess(self, account, equity, observed_at, now=None, balance=None, daily_realised=None):
         rules = account['drawdown_rules']
         if (str(account.get('trader_account_id') or account.get('id')) != rules['account_id']
                 or str(account.get('mt5_login')) != rules['mt5_login']
@@ -156,7 +182,7 @@ class EquityDrawdownJournal:
                 if not 0 <= (now - started).total_seconds() <= 300:
                     raise ValueError('Existing account watermark must be recovered; it cannot be reset')
                 state = initial(rules)
-            updated = evaluate(rules, state, equity, observed_at, balance=balance)
+            updated = evaluate(rules, state, equity, observed_at, balance=balance, daily_realised=daily_realised)
             if updated != state or not path.exists():
                 temporary = path.with_suffix('.' + str(uuid4()) + '.tmp')
                 try:
@@ -178,9 +204,9 @@ class DrawdownStateStore:
         self.headers = {'apikey': key, 'Authorization': 'Bearer ' + key,
             'Prefer': 'return=representation'}
 
-    def assess(self, account, purchase, equity, observed_at, now=None, peak_equity=None):
+    def assess(self, account, purchase, equity, observed_at, now=None, peak_equity=None, balance=None, daily_realised=None):
         rules = spec(account, purchase)
-        if rules['drawdown_type'] != 'TRAILING':
+        if rules['drawdown_type'] != 'TRAILING' and not rules.get('daily_drawdown'):
             raise ValueError('Durable trailing journal requires trailing terms')
         now = now or datetime.now(timezone.utc)
         observed = timestamp(observed_at)
@@ -202,7 +228,7 @@ class DrawdownStateStore:
                 previous = initial(rules)
             else:
                 previous = json.loads(raw)
-            state = evaluate(rules, previous, equity, observed_at, peak_equity=peak_equity)
+            state = evaluate(rules, previous, equity, observed_at, peak_equity=peak_equity, balance=balance, daily_realised=daily_realised)
             if raw is not None and state == previous:
                 return state
             value = json.dumps(state, sort_keys=True, separators=(',', ':'))
@@ -224,7 +250,7 @@ class DrawdownStateStore:
 
 def runtime_ready():
     """An operator can enable sales after installing and verifying every DD shard."""
-    return os.environ.get('NP_EQUITY_TRAILING_VERIFIED', '') == RELEASE and bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY'))
+    return bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')) and (os.environ.get('NP_EQUITY_TRAILING_VERIFIED', '') == RELEASE or __import__('plan_risk_controls').daily_runtime_ready())
 
 
 def account_mode(account, purchase=None):

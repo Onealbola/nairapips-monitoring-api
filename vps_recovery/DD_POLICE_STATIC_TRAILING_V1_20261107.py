@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 import MetaTrader5 as mt5
 
-RELEASE = "NAIRAPIPS_DD_POLICE_STATIC_EQUITY_TRAILING_V1_20261107"
+RELEASE = "NAIRAPIPS_DD_POLICE_STATIC_TRAILING_DAILY_V1_20261108"
 # V3.15 surgical performance repair:
 # - NO change to DD calculation, DD limits, breach threshold, latch, close logic,
 #   shard ownership, roster contract, or risk priorities.
@@ -813,7 +813,7 @@ def _dashboard_feed_worker():
 
         try:
             outbound = dict(payload)
-            outbound["source"] = "dd_police_live_mt5_v320"
+            outbound["source"] = (f"dd_police_daily_v1_shard_{SHARD_ID}_of_{TOTAL_SHARDS}" if _daily_probe_ready else "dd_police_live_mt5_v320")
             outbound["observed_at"] = outbound.get("timestamp") or now_iso()
             if not LIVE_STATE_ENDPOINT or not LIVE_STATE_KEY:
                 log(f"DASHBOARD FEED DROP account={login}: clean live-state env missing | DD POLICING UNAFFECTED", "WARNING")
@@ -956,15 +956,20 @@ from package_dd_runtime import PackageDDJournal, PackageDDUnavailable
 from equity_drawdown import EquityDrawdownJournal, RELEASE as TRAILING_RELEASE
 _package_dd_journal = None
 _equity_dd_journal = None
+_daily_probe_ready = False
 
 def inspect(row):
-    global _package_dd_journal, _equity_dd_journal
+    global _package_dd_journal, _equity_dd_journal, _daily_probe_ready
     package_account=bool(row.get("package_contract_id") or row.get("package_rules_hash"))
     package_dd_result=None
     trailing_breach=None
     equity_trailing = str(row.get("drawdown_type") or "STATIC").upper() == "TRAILING" and not package_account
+    from plan_risk_controls import daily_percent, broker_daily_realised
+    daily_enabled = daily_percent(row) > 0
+    durable_risk = equity_trailing or daily_enabled
+    daily_realised = None
     login=norm(row.get("mt5_login"))
-    if equity_trailing and not (os.getenv("NP_EQUITY_TRAILING_INGEST_KEY") or LIVE_STATE_KEY):
+    if durable_risk and not (os.getenv("NP_EQUITY_TRAILING_INGEST_KEY") or LIVE_STATE_KEY):
         log(f"TRAILING COLLECTOR KEY MISSING MT5={login}; update shard configuration", "CRITICAL")
         return AUTH_RETRY_SECONDS
     ok,limit,rule_source=dd_rule(row)
@@ -987,7 +992,7 @@ def inspect(row):
     info=a["info"]
     bal=float(info.balance or 0); eq=float(info.equity or 0)
     start=starting_capital(row,bal)
-    if start<=0 or (not (package_account or equity_trailing) and (bal<=0 or eq<=0)):
+    if start<=0 or (not (package_account or durable_risk) and (bal<=0 or eq<=0)):
         invalid_live_capital[login]=f"start={start} balance={bal} equity={eq}"
         log(f"INVALID LIVE CAPITAL MT5={login} start={start} balance={bal} equity={eq} | NO DD DECISION","ERROR")
         return AUTH_RETRY_SECONDS
@@ -1003,6 +1008,14 @@ def inspect(row):
     last_valid_dd_read[login]=time.monotonic()
     last_inspected[login]=last_valid_dd_read[login]
 
+    if daily_enabled or not _daily_probe_ready:
+        try:
+            daily_realised = broker_daily_realised(mt5, row, now_iso())
+            _daily_probe_ready = True
+        except Exception as exc:
+            if daily_enabled:
+                log(f"DAILY HISTORY UNAVAILABLE MT5={login}: {type(exc).__name__}; overall breach protection retained", "ERROR")
+
     if package_account:
         try:
             if _package_dd_journal is None:
@@ -1014,11 +1027,11 @@ def inspect(row):
         except PackageDDUnavailable:
             log(f"PACKAGE DD STATE UNAVAILABLE MT5={login}; no default rule or watermark reset is permitted","CRITICAL")
             return AUTH_RETRY_SECONDS
-    elif equity_trailing:
+    elif durable_risk:
         try:
             if _equity_dd_journal is None:
                 _equity_dd_journal = EquityDrawdownJournal(os.getenv("NP_EQUITY_DD_JOURNAL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "equity_dd_state")))
-            trailing = _equity_dd_journal.assess(row, eq, now_iso(), balance=bal)
+            trailing = _equity_dd_journal.assess(row, eq, now_iso(), balance=bal, daily_realised=daily_realised)
             risk=eq; dd=float(trailing["drawdown_percent"]); used=float(trailing["used_percent"])
             breach_level=float(trailing["drawdown_floor"]); rule_source=TRAILING_RELEASE
             if trailing["breached"]:
@@ -1046,7 +1059,9 @@ def inspect(row):
             "mt5_login": str(login),
             "open_positions":len(positions), "position_count":len(positions),
             "drawdown_type": "TRAILING" if equity_trailing else row.get("drawdown_type", "STATIC"),
-            "trailing_highest_equity": float(trailing["highest_equity"]) if equity_trailing else None,
+            "trailing_highest_equity": float(trailing["highest_equity"]) if durable_risk else None,
+            "daily_drawdown": float(daily_percent(row)),
+            "daily_realised": str(daily_realised) if daily_realised is not None and daily_enabled else None,
             "balance": bal, "current_balance": bal, "mt5_balance": bal,
             "equity": eq, "current_equity": eq, "mt5_equity": eq,
             "start_balance": start, "account_size": start,
@@ -1104,6 +1119,10 @@ def inspect(row):
                 "breached":True,"zone":"breached","status":"breached",
                 "phase_label":row.get("phase") or row.get("stage") or "",
                 "dd_authority_source":rule_source,
+                "source": f"dd_police_daily_v1_shard_{SHARD_ID}_of_{TOTAL_SHARDS}" if _daily_probe_ready else "dd_police_live_mt5_v320",
+                "daily_realised": trailing.get("daily_realised") if daily_enabled else None,
+                "trailing_highest_equity": trailing.get("highest_equity") if durable_risk else None,
+                "daily_drawdown": float(daily_percent(row)),
                 "open_positions_at_breach":positions,
             }
             if breach_record and breach_record["first_breach"]:
@@ -1236,6 +1255,7 @@ def health():
         tmp=path+".tmp"
         payload={
             "release": RELEASE,
+            "daily_history_probe_ready": _daily_probe_ready,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "shard": SHARD_ID,
             "total_shards": TOTAL_SHARDS,

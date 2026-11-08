@@ -43,7 +43,7 @@ def persist_event(ev):
     # Snapshot is useful evidence, but disable endpoint is the authoritative
     # terminal lock. Retry until disable succeeds.
     try:
-        requests.post(SNAPSHOT_ENDPOINT, json=ev, timeout=HTTP_TIMEOUT)
+        requests.post(SNAPSHOT_ENDPOINT, json=ev, headers={"X-NP-Trailing-Key": os.getenv("NP_EQUITY_TRAILING_INGEST_KEY") or os.getenv("NP_LIVE_STATE_INGEST_KEY", "")}, timeout=HTTP_TIMEOUT)
     except Exception:
         pass
 
@@ -51,7 +51,7 @@ def persist_event(ev):
     payload["status"] = "breached"
     payload["reason"] = "MAX_DRAWDOWN_BREACH"
     try:
-        r = requests.post(DISABLE_ENDPOINT, json=payload, timeout=HTTP_TIMEOUT)
+        r = requests.post(DISABLE_ENDPOINT, json=payload, headers={"X-NP-Trailing-Key": os.getenv("NP_EQUITY_TRAILING_INGEST_KEY") or os.getenv("NP_LIVE_STATE_INGEST_KEY", "")}, timeout=HTTP_TIMEOUT)
         if r.status_code in (200, 201):
             return True
         log(f"BACKEND REJECT mt5={ev.get('mt5_login')} http={r.status_code} body={(r.text or '')[:180]}")
