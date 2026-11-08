@@ -56,7 +56,13 @@ def inherit(source,row):return freeze(source,read(row))
 def cap_percent(row):
     terms=read(row)
     return (Decimal(terms['profit_cap']) if terms['profit_cap_enabled'] else None) if terms else Decimal(15)
-def ready():return os.environ.get('NP_PLAN_WITHDRAWAL_VERIFIED')==RELEASE
+def ready():
+    if os.environ.get('NP_PLAN_WITHDRAWAL_VERIFIED')==RELEASE:return True
+    try:
+        from withdrawal_runtime import verified_installation
+        return verified_installation()
+    except ImportError:
+        return False
 
 def edit(row,body):
     if not FIELDS.intersection(body):return row
