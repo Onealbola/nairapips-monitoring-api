@@ -49,7 +49,7 @@ def timestamp(value):
     return result.astimezone(timezone.utc)
 
 
-def make_contract(priced, trader_id, contract_id=None):
+def make_contract(priced, trader_id, contract_id=None, trailing_formula=None):
     """Input is a validated server quote; never accept a browser-supplied price."""
     s = priced['selection']
     capital = dec(s['capital'])
@@ -62,7 +62,7 @@ def make_contract(priced, trader_id, contract_id=None):
         rules[stage] = dict(target_percent=str(target) if target is not None else None,
                             target_basis='equity', require_flat_before_pass=True,
                             drawdown_percent=str(dec(s['drawdown'])), drawdown_type=s['drawdown_type'],
-                            trailing_formula='highest_observed_equity_minus_initial_capital_allowance' if s['drawdown_type']=='trailing' else None)
+                            trailing_formula=(trailing_formula or 'highest_observed_equity_minus_initial_capital_allowance') if s['drawdown_type']=='trailing' else None)
     document = dict(contract_id=identity(contract_id or uuid4()), trader_id=identity(trader_id),
                     rules_version=RULES_VERSION, catalog_revision=priced['catalog_revision'],
                     currency='NGN', capital=money(capital), purchase_price=money(priced['total']),
@@ -101,7 +101,7 @@ def validate_contract(doc, expected_hash=None):
         elif not 0<dec(rule['target_percent'])<=100:
             raise ValueError('Invalid stage target')
         expected='highest_observed_equity_minus_initial_capital_allowance' if rule['drawdown_type']=='trailing' else None
-        if rule['trailing_formula']!=expected:raise ValueError('Unsupported trailing formula')
+        if rule['trailing_formula']!=expected and not (rule['drawdown_type']=='trailing' and rule['trailing_formula']=='highest_closed_balance_percent'):raise ValueError('Unsupported trailing formula')
     if not 0<dec(doc['profit_share_percent'])<=100:raise ValueError('Invalid profit share')
     if doc['gross_profit_cap_percent'] is not None and not 0<dec(doc['gross_profit_cap_percent'])<=1000:raise ValueError('Invalid gross profit cap')
     for key in ('phase_resets','funded_resets'):
@@ -144,8 +144,13 @@ def evaluate(contract, state, observation):
     result=deepcopy(state);capital=dec(contract['capital']);rule=contract['stage_rules'][state['stage']]
     high=max(dec(state['highest_equity']),equity)
     low=min(dec(state['lowest_equity']),equity) if state['lowest_equity'] is not None else equity
-    allowance=capital*dec(rule['drawdown_percent'])/100
-    floor=(high if rule['drawdown_type']=='trailing' else capital)-allowance
+    reference=high if rule['drawdown_type']=='trailing' else capital
+    balance_trailing=rule['trailing_formula']=='highest_closed_balance_percent'
+    if balance_trailing:
+        reference=max(capital,dec(state.get('highest_balance',capital)),dec(observation['trailing_highest_balance']))
+        result['highest_balance']=money(reference)
+    allowance=(reference if balance_trailing else capital)*dec(rule['drawdown_percent'])/100
+    floor=reference-allowance
     decision='profit_cap_reached' if state['decision']=='profit_cap_reached' else 'active'
     # A simultaneous target and DD observation must never manufacture a pass.
     if equity<=floor:decision='breached'

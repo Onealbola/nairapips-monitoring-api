@@ -960,7 +960,7 @@ def apply_intelligence(account, snapshot):
         import requests
         purchase = fetch_purchase_by_id(account.get("purchase_id")) if account.get("purchase_id") else {}
         trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(
-            dict(account, dd_limit_percent=dd_limit_percent), purchase, equity, snapshot.get("timestamp") or snapshot.get("observed_at"), peak_equity=snapshot.get("trailing_highest_equity"), balance=current_balance, daily_realised=snapshot.get("daily_realised"))
+            dict(account, dd_limit_percent=dd_limit_percent), purchase, equity, snapshot.get("timestamp") or snapshot.get("observed_at"), peak_equity=snapshot.get("trailing_highest_equity"), balance=current_balance, daily_realised=snapshot.get("daily_realised"), peak_balance=snapshot.get("trailing_highest_balance"))
         if trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(snapshot.get("timestamp") or snapshot.get("observed_at")).isoformat():
             return {"account_id": account.get("id"), "ignored": True, "account_write_ok": True, "reason": "out_of_order_trailing_observation"}
         highest = float(trailing_state["highest_equity"])
@@ -3588,7 +3588,7 @@ def monitoring_snapshot():
         if account_mode(account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
             __import__("equity_drawdown").verify_ingest(request)
             import requests
-            _state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(account, _purchase, _eq, _obs.isoformat(), peak_equity=data.get("trailing_highest_equity"),balance=_bal,daily_realised=data.get("daily_realised"))
+            _state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_KEY).assess(account, _purchase, _eq, _obs.isoformat(), peak_equity=data.get("trailing_highest_equity"),balance=_bal,daily_realised=data.get("daily_realised"),peak_balance=data.get("trailing_highest_balance"))
             if _state["last_observed_at"] != _obs.isoformat():
                 return ok({"ignored": True, "reason": "out_of_order_trailing_observation"})
             data = dict(data, drawdown_percent=float(_state["drawdown_percent"]),
@@ -4495,4 +4495,4 @@ def drawdown_version():
         response.headers["Cache-Control"] = "no-store"
         return response
     from equity_drawdown import RELEASE
-    return jsonify(success=True,release=RELEASE,plan_controls_release=__import__('plan_risk_controls').RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))
+    return jsonify(success=True,release=RELEASE,plan_controls_release=__import__('plan_risk_controls').RELEASE,modes=['STATIC','TRAILING'],trailing_basis='highest_equity',future_trailing_formula=__import__('balance_trailing').FORMULA,future_trailing_basis='highest_closed_balance',collector_auth_configured=bool(os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or os.environ.get('NP_LIVE_STATE_INGEST_KEY')))

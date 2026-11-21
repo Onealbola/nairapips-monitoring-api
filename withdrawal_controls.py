@@ -12,15 +12,32 @@ def number(value,maximum=100000000):
     if not x.is_finite() or not 0<=x<=maximum or x!=x.quantize(Decimal('.01')):raise ValueError('Withdrawal values must be finite, non-negative and have at most two decimals')
     return x
 
+def normalize_inactive(row):
+    """An unchecked optional rule may be blank; retain remembered real values."""
+    result=dict(row)
+    pairs=(('minimum_withdrawal','minimum_withdrawal_enabled',False),
+           ('minimum_profit_percent','minimum_profit_enabled',False),
+           ('profit_cap','profit_cap_enabled',True))
+    for field,flag,default in pairs:
+        raw=result.get(field)
+        if result.get(flag,default) is False and field in result and (raw is None or (isinstance(raw,str) and not raw.strip())):
+            result[field]=0
+    return result
+
+def field_number(row,key,default,maximum,label):
+    try:return number(row.get(key,default),maximum)
+    except ValueError as exc:raise ValueError(label+': '+str(exc)) from exc
+
 def selected(row):
     if not FIELDS.intersection(row):return None
+    row=normalize_inactive(row)
     flags={k:row.get(k,True if k=='profit_cap_enabled' else False) for k in ('minimum_withdrawal_enabled','minimum_profit_enabled','profit_cap_enabled')}
     if any(type(v) is not bool for v in flags.values()):raise ValueError('Use the withdrawal rule checkboxes')
-    values={'minimum_withdrawal':number(row.get('minimum_withdrawal',0)),
-            'minimum_profit_percent':number(row.get('minimum_profit_percent',0),100),
-            'profit_cap':number(row.get('profit_cap',15),100)}
+    values={'minimum_withdrawal':field_number(row,'minimum_withdrawal',0,100000000,'Minimum withdrawal amount'),
+            'minimum_profit_percent':field_number(row,'minimum_profit_percent',0,100,'Minimum profit before withdrawal'),
+            'profit_cap':field_number(row,'profit_cap',15,100,'Gross profit cap')}
     for flag,key in (('minimum_withdrawal_enabled','minimum_withdrawal'),('minimum_profit_enabled','minimum_profit_percent'),('profit_cap_enabled','profit_cap')):
-        if flags[flag] and values[key]<=0:raise ValueError('Enter a positive value or turn its withdrawal checkbox off')
+        if flags[flag] and values[key]<=0:raise ValueError({'minimum_withdrawal':'Minimum withdrawal amount','minimum_profit_percent':'Minimum profit before withdrawal','profit_cap':'Gross profit cap'}[key]+': enter a positive value or turn its checkbox off')
     if flags['profit_cap_enabled'] and flags['minimum_profit_enabled'] and values['minimum_profit_percent']>values['profit_cap']:raise ValueError('Minimum profit target cannot exceed the profit cap')
     if flags['minimum_withdrawal_enabled'] and flags['profit_cap_enabled'] and row.get('account_size') and row.get('payout_split'):
         maximum=number(row['account_size'],1000000000)*values['profit_cap']/100*number(row['payout_split'],100)/100
@@ -76,6 +93,8 @@ def needs_broker_update(row):return cap_percent(row)!=Decimal(15)
 def validate_request(row,amount,quote=None,require_verified=False):
     terms=read(row)
     if not terms:return
+    if terms['minimum_profit_enabled'] and not (quote or {}).get('verified'):
+        raise ValueError('Your profit target must be verified against a fresh account update before payout')
     amount=number(amount)
     if terms['minimum_withdrawal_enabled'] and amount<Decimal(terms['minimum_withdrawal']):
         raise ValueError('Minimum withdrawal for this plan is ₦'+format(Decimal(terms['minimum_withdrawal']),',.2f'))

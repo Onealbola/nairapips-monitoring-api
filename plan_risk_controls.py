@@ -75,6 +75,10 @@ def freeze(source, terms):
         raise ValueError('Invalid payout schedule')
     if terms.get('resets'):
         payload['resets'] = terms['resets']
+    if terms.get('trailing_formula') is not None:
+        from balance_trailing import FORMULA
+        if terms['trailing_formula']!=FORMULA:raise ValueError('Unsupported frozen trailing formula')
+        payload['trailing_formula']=FORMULA
     encoded = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).decode().rstrip('=')
     return str(source or '') + MARKER + encoded
 
@@ -86,8 +90,9 @@ def frozen_terms(row):
     try:
         encoded = source.rsplit(MARKER, 1)[1]
         result = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
-        if not {'daily_drawdown', 'payout_frequency'} <= set(result) or set(result)-{'daily_drawdown','payout_frequency','resets'}:
+        if not {'daily_drawdown', 'payout_frequency'} <= set(result) or set(result)-{'daily_drawdown','payout_frequency','resets','trailing_formula'}:
             raise ValueError()
+        if 'trailing_formula' in result and result['trailing_formula']!=__import__('balance_trailing').FORMULA:raise ValueError()
         percentage(result['daily_drawdown'])
         if result['payout_frequency'] not in FREQUENCIES:
             raise ValueError()
@@ -110,6 +115,27 @@ def inherit(source, row):
     terms = frozen_terms(row)
     source = __import__('withdrawal_controls').inherit(source,row)
     return freeze(source, terms) if terms else source
+
+
+def assert_assignment_snapshot(account, purchase):
+    """Refuse a new assignment that would drop its exact purchased controls.
+
+    This validates the proposed insert only; it never edits existing accounts or
+    reconstructs missing broker history from current values.
+    """
+    if not purchase or not purchase.get('id'):
+        return
+    if (str(account.get('purchase_id') or '') != str(purchase['id'])
+            or str(account.get('trader_id') or '') != str(purchase.get('trader_id') or '')):
+        raise ValueError('Assignment risk snapshot belongs to another purchase or owner')
+    if frozen_terms(account) != frozen_terms(purchase):
+        raise ValueError('Assignment stopped: purchased daily, payout or reset rules were not preserved')
+    from withdrawal_controls import read as withdrawal_terms
+    if withdrawal_terms(account) != withdrawal_terms(purchase):
+        raise ValueError('Assignment stopped: purchased withdrawal rules were not preserved')
+    from equity_drawdown import account_mode, mode
+    if account_mode(account) != mode(purchase.get('drawdown_type')):
+        raise ValueError('Assignment stopped: purchased drawdown mode was not preserved')
 
 
 def plan_controls_view(row):
@@ -158,38 +184,87 @@ def edit_plan_controls(row, body):
 
 
 def broker_daily_realised(mt5, row, observed_at):
-    """Trading net P/L since WAT midnight; deposits and withdrawals are excluded."""
+    """Verify the assigned account's balance ledger before accepting daily P/L.
+
+    An empty/stale history after account switching is not evidence of zero loss.
+    Reconcile all post-assignment balance entries, then select this WAT day.
+    Transfers affect the balance proof but are excluded from trading P/L.
+    """
     observed = parse_time(observed_at)
-    start = observed.astimezone(WAT).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    day_start = observed.astimezone(WAT).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     assigned = row.get('account_started_at') or row.get('started_at') or row.get('created_at')
-    if assigned:
-        start = max(start, parse_time(assigned))
+    if not assigned:
+        raise ValueError('Exact account assignment time is required for daily history')
+    start = parse_time(assigned)
     if start > observed:
         raise ValueError('Account assignment is in the future')
     expected = str(row.get('mt5_login'))
+    def money(value):
+        if isinstance(value,bool):raise ValueError('Invalid broker ledger amount')
+        amount=Decimal(str(value))
+        if not amount.is_finite():raise ValueError('Invalid broker ledger amount')
+        return amount
+    capital=money(row.get('start_balance') or row.get('account_size') or 0)
+    if capital<=0:raise ValueError('Exact initial capital is required for daily history')
     info = mt5.account_info()
     if info is None or str(info.login) != expected:
         raise ValueError('Daily history account identity mismatch')
+    before=money(info.balance)
     deals = mt5.history_deals_get(start, observed)
     if deals is None:
         raise ValueError('Daily broker trading history unavailable')
-    total = Decimal(0)
+    ledger=Decimal(0);total=Decimal(0);seen=set()
     for deal in deals:
-        if getattr(deal, 'type', None) not in (0, 1):
-            continue
-        for field in ('profit', 'commission', 'swap', 'fee'):
-            value = getattr(deal, field, 0) or 0
-            if isinstance(value, bool):
-                raise ValueError('Invalid daily trading evidence')
-            amount = Decimal(str(value))
-            if not amount.is_finite():
-                raise ValueError('Invalid daily trading evidence')
-            total += amount
+        ticket=getattr(deal,'ticket',None)
+        if ticket is None or ticket in seen:raise ValueError('Broker deal identity missing or duplicated')
+        seen.add(ticket)
+        kind=getattr(deal,'type',None)
+        if isinstance(kind,bool) or not isinstance(kind,int):raise ValueError('Broker deal type missing')
+        raw_time=getattr(deal,'time_msc',0)
+        raw_time=money(raw_time)/1000 if raw_time else money(getattr(deal,'time',0))
+        when=datetime.fromtimestamp(float(raw_time),timezone.utc)
+        # MT5 ranges have second precision while assignment/observation timestamps
+        # can include fractions. Boundary deals belong to this same lifecycle.
+        if when < start.replace(microsecond=0) or when > observed:
+            raise ValueError('Broker deal lies outside the verified history window')
+        net=sum((money(getattr(deal,field,0) or 0) for field in ('profit','commission','swap','fee')),Decimal(0))
+        if kind!=3:ledger+=net # MT5 CREDIT changes account credit, not balance.
+        if kind in (0,1) and when>=day_start:total+=net
     info = mt5.account_info()
     if info is None or str(info.login) != expected:
         raise ValueError('Terminal account changed during daily history read')
+    after=money(info.balance)
+    if abs(after-before)>Decimal('.01'):
+        raise ValueError('Broker balance changed during daily history read; retry required')
+    if not deals or abs(capital+ledger-after)>Decimal('.01'):
+        # Some brokers timestamp initial funding after delivery. Verify the
+        # complete balance ledger independently instead of counting funding twice.
+        full=mt5.history_deals_get(datetime(1970,1,1,tzinfo=timezone.utc),observed)
+        if full is None:raise ValueError('Full broker balance ledger unavailable')
+        full_net=Decimal(0);initial_funds=Decimal(0);daily_net=Decimal(0);full_seen=set();first_trade=False
+        ordered=sorted(full,key=lambda d:(getattr(d,'time_msc',0) or getattr(d,'time',0)*1000,getattr(d,'ticket',0)))
+        for deal in ordered:
+            ticket=getattr(deal,'ticket',None);kind=getattr(deal,'type',None)
+            if ticket is None or ticket in full_seen:raise ValueError('Full broker deal identity missing or duplicated')
+            full_seen.add(ticket)
+            if isinstance(kind,bool) or not isinstance(kind,int):raise ValueError('Full broker deal type missing')
+            raw_time=getattr(deal,'time_msc',0)
+            raw_time=money(raw_time)/1000 if raw_time else money(getattr(deal,'time',0))
+            when=datetime.fromtimestamp(float(raw_time),timezone.utc)
+            if when>observed:raise ValueError('Full broker ledger includes a future deal')
+            net=sum((money(getattr(deal,field,0) or 0) for field in ('profit','commission','swap','fee')),Decimal(0))
+            if kind in (0,1):first_trade=True
+            if kind!=3:
+                full_net+=net
+                if not first_trade:initial_funds+=net
+            if kind in (0,1) and max(day_start,start)<=when<=observed:daily_net+=net
+        checked=mt5.account_info()
+        if (checked is None or str(checked.login)!=expected or money(checked.balance)!=after):
+            raise ValueError('Broker account changed during full balance-ledger verification')
+        if abs(full_net-after)>Decimal('.01') or abs(initial_funds-capital)>Decimal('.01'):
+            raise ValueError('Broker history does not reconcile to the assigned capital and current balance')
+        total=daily_net
     return total
-
 
 _ready_cache = (0, False)
 
@@ -217,6 +292,8 @@ def daily_runtime_ready():
             params={'select': 'source', 'observed_at': 'gte.' + cutoff, 'limit': '1000'}, timeout=(2, 3))
         response.raise_for_status()
         sources = {row.get('source') for row in response.json()}
+        from balance_trailing import SOURCE_PREFIX
+        sources={str(s).replace(SOURCE_PREFIX,'dd_police_daily_v1_shard_') if str(s).startswith(SOURCE_PREFIX) else s for s in sources}
         expected = {'dd_police_daily_v1_shard_%d_of_4' % n for n in range(1,5)}
         rollback = any(str(source).startswith('dd_police') and source not in expected for source in sources)
         if not confirmed and expected <= sources:
@@ -252,7 +329,7 @@ def daily_breach_proof(account, data, now=None):
         raise ValueError('Account did not purchase daily drawdown')
     state = evaluate(rules, initial(rules), data.get('current_equity',data.get('equity')),
         observed.isoformat(), balance=data.get('current_balance',data.get('balance')),
-        daily_realised=data.get('daily_realised'), peak_equity=data.get('trailing_highest_equity'))
+        daily_realised=data.get('daily_realised'), peak_equity=data.get('trailing_highest_equity'), peak_balance=data.get('trailing_highest_balance'))
     if not state['breached']:
         raise ValueError('Broker evidence does not cross the purchased loss floor')
     return state

@@ -68,6 +68,9 @@ def spec(account, purchase=None):
     daily = daily_percent(account)
     if daily > 0:
         result['daily_drawdown'] = str(daily.normalize())
+    if __import__('balance_trailing').uses_balance_percent(account):
+        if result['drawdown_type']!='TRAILING':raise ValueError('Balance trailing requires a trailing purchase')
+        result['trailing_formula']=__import__('balance_trailing').FORMULA
     return result
 
 
@@ -76,11 +79,13 @@ def fingerprint(rules):
 
 
 def initial(rules):
-    return dict(rules_hash=fingerprint(rules), highest_equity=rules['capital'],
+    state=dict(rules_hash=fingerprint(rules), highest_equity=rules['capital'],
         last_observed_at=None, breached=False, first_breach=None, worst_used_percent='0')
+    if rules.get('trailing_formula')==__import__('balance_trailing').FORMULA:state['highest_balance']=rules['capital']
+    return state
 
 
-def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=None, daily_realised=None):
+def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=None, daily_realised=None, peak_balance=None):
     """Evaluate in observation order; a low before a high cannot breach later."""
     if previous['rules_hash'] != fingerprint(rules):
         raise ValueError('Account identity or frozen rules changed')
@@ -102,8 +107,13 @@ def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=Non
     if previous['breached']:
         return state
     high = max(capital, high, equity, number(peak_equity) if peak_equity is not None else capital)
-    allowance = capital * limit / 100
+    balance_trailing=rules.get('trailing_formula')==__import__('balance_trailing').FORMULA
     reference = high if mode(rules['drawdown_type']) == 'TRAILING' else capital
+    if balance_trailing:
+        if balance is None or peak_balance is None:raise ValueError('Verified highest closed balance is required')
+        reference=max(capital,number(previous['highest_balance']),number(peak_balance))
+        state['highest_balance']=str(reference)
+    allowance = (reference if balance_trailing else capital) * limit / 100
     floor = reference - allowance
     risk_value = equity if mode(rules['drawdown_type']) == 'TRAILING' or balance is None else min(equity, number(balance))
     damage = max(Decimal(0), reference - risk_value)
@@ -131,7 +141,7 @@ def evaluate(rules, previous, equity, observed_at, peak_equity=None, balance=Non
         used = max(used, daily_used)
     breach = overall_breach or daily_breach
     state.update(highest_equity=str(high), equity=str(equity), drawdown_floor=str(floor),
-        drawdown_amount=str(damage), drawdown_percent=str(damage / capital * 100),
+        drawdown_amount=str(damage), drawdown_percent=str(damage / (reference if balance_trailing else capital) * 100),
         used_percent=str(used), worst_used_percent=str(max(number(previous['worst_used_percent']), used)),
         breached=breach, last_observed_at=observed.isoformat())
     if breach:
@@ -160,7 +170,7 @@ class EquityDrawdownJournal:
     def __init__(self, directory):
         self.directory = Path(directory)
 
-    def assess(self, account, equity, observed_at, now=None, balance=None, daily_realised=None):
+    def assess(self, account, equity, observed_at, now=None, balance=None, daily_realised=None, peak_balance=None):
         rules = account['drawdown_rules']
         if (str(account.get('trader_account_id') or account.get('id')) != rules['account_id']
                 or str(account.get('mt5_login')) != rules['mt5_login']
@@ -182,7 +192,7 @@ class EquityDrawdownJournal:
                 if not 0 <= (now - started).total_seconds() <= 300:
                     raise ValueError('Existing account watermark must be recovered; it cannot be reset')
                 state = initial(rules)
-            updated = evaluate(rules, state, equity, observed_at, balance=balance, daily_realised=daily_realised)
+            updated = evaluate(rules, state, equity, observed_at, balance=balance, daily_realised=daily_realised, peak_balance=peak_balance)
             if updated != state or not path.exists():
                 temporary = path.with_suffix('.' + str(uuid4()) + '.tmp')
                 try:
@@ -204,7 +214,7 @@ class DrawdownStateStore:
         self.headers = {'apikey': key, 'Authorization': 'Bearer ' + key,
             'Prefer': 'return=representation'}
 
-    def assess(self, account, purchase, equity, observed_at, now=None, peak_equity=None, balance=None, daily_realised=None):
+    def assess(self, account, purchase, equity, observed_at, now=None, peak_equity=None, balance=None, daily_realised=None, peak_balance=None):
         rules = spec(account, purchase)
         if rules['drawdown_type'] != 'TRAILING' and not rules.get('daily_drawdown'):
             raise ValueError('Durable trailing journal requires trailing terms')
@@ -228,7 +238,7 @@ class DrawdownStateStore:
                 previous = initial(rules)
             else:
                 previous = json.loads(raw)
-            state = evaluate(rules, previous, equity, observed_at, peak_equity=peak_equity, balance=balance, daily_realised=daily_realised)
+            state = evaluate(rules, previous, equity, observed_at, peak_equity=peak_equity, balance=balance, daily_realised=daily_realised, peak_balance=peak_balance)
             if raw is not None and state == previous:
                 return state
             value = json.dumps(state, sort_keys=True, separators=(',', ':'))

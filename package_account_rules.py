@@ -35,7 +35,7 @@ def bind_package_account(account,contract):
           'package_rules_hash':hash,'package_contract':{key:contract[key] for key in ('id','trader_id','purchase_id','rules_hash','document')},'package_document':doc,
           'package_account_started_at':account.get('started_at') or account.get('created_at'),
           'stage':stage,'capital':float(capital),'dd_limit_percent':float(dec(rule['drawdown_percent'])),
-          'drawdown_type':rule['drawdown_type'],'dd_authority_present':True,
+          'drawdown_type':rule['drawdown_type'],'trailing_formula':rule['trailing_formula'],'dd_authority_present':True,
           'dd_authority_source':'immutable_package_contract','target_percent':float(dec(rule['target_percent'])) if rule['target_percent'] is not None else 0.0,
           'target_authority_present':True,'target_authority_source':'immutable_package_contract',
           'one_phase':'phase2' not in doc['stages'],'second_life_enabled':False,
